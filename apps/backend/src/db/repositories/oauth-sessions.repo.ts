@@ -80,11 +80,8 @@ export class OAuthSessionsRepository {
     return updatedSession;
   }
 
-  // Dedicated clear path for `expected_state`. The truthy-spread upsert
-  // cannot write NULL through `input.expected_state` (a `null` value would
-  // be elided by the `&&` guard), so the one-shot clear after a successful
-  // token exchange goes through this method instead. Returns the updated
-  // row, or undefined if no row exists for the server.
+  // Explicit unconditional reset for session maintenance. Callback exchange
+  // must use compareAndSetExpectedState so it cannot clear a newer attempt.
   async clearExpectedState(
     mcpServerUuid: string,
     userId: string,
@@ -104,6 +101,29 @@ export class OAuthSessionsRepository {
       .returning();
 
     return updatedSession;
+  }
+
+  // Atomic claim/consume/restore for one authorization attempt. Matching the
+  // previous value prevents competing callbacks or a newer authorize flow
+  // from being overwritten by a stale request.
+  async compareAndSetExpectedState(
+    mcpServerUuid: string,
+    userId: string,
+    expectedState: string,
+    nextState: string | null,
+  ): Promise<boolean> {
+    const [updatedSession] = await db
+      .update(oauthSessionsTable)
+      .set({ expected_state: nextState, updated_at: sql`NOW()` })
+      .where(
+        and(
+          eq(oauthSessionsTable.mcp_server_uuid, mcpServerUuid),
+          eq(oauthSessionsTable.user_id, userId),
+          eq(oauthSessionsTable.expected_state, expectedState),
+        ),
+      )
+      .returning();
+    return Boolean(updatedSession);
   }
 
   async upsert(input: OAuthSessionUpdateInput): Promise<DatabaseOAuthSession> {

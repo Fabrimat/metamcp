@@ -236,6 +236,68 @@ describe("OAuthSessionsRepository", () => {
     ).toBe("state-b");
   });
 
+  it("atomically claims an exact state once without touching another principal", async () => {
+    await repo.upsert({
+      mcp_server_uuid: serverId,
+      user_id: userA,
+      expected_state: "original",
+    });
+    await repo.upsert({
+      mcp_server_uuid: serverId,
+      user_id: userB,
+      expected_state: "original",
+    });
+    const claims = await Promise.all([
+      repo.compareAndSetExpectedState(serverId, userA, "original", "claim-a"),
+      repo.compareAndSetExpectedState(serverId, userA, "original", "claim-b"),
+    ]);
+    expect(claims).toEqual([true, false]);
+    expect(
+      (await repo.findByMcpServerAndUser(serverId, userA))?.expected_state,
+    ).toBe("claim-a");
+    expect(
+      (await repo.findByMcpServerAndUser(serverId, userB))?.expected_state,
+    ).toBe("original");
+  });
+
+  it.each([null, "original"])(
+    "only the current claim may transition to %s",
+    async (nextState) => {
+      await repo.upsert({
+        mcp_server_uuid: serverId,
+        user_id: userA,
+        expected_state: "claim-a",
+      });
+      expect(
+        await repo.compareAndSetExpectedState(
+          serverId,
+          userA,
+          "claim-a",
+          nextState,
+        ),
+      ).toBe(true);
+      expect(
+        (await repo.findByMcpServerAndUser(serverId, userA))?.expected_state,
+      ).toBe(nextState);
+      await repo.upsert({
+        mcp_server_uuid: serverId,
+        user_id: userA,
+        expected_state: "new-attempt",
+      });
+      expect(
+        await repo.compareAndSetExpectedState(
+          serverId,
+          userA,
+          "claim-a",
+          nextState,
+        ),
+      ).toBe(false);
+      expect(
+        (await repo.findByMcpServerAndUser(serverId, userA))?.expected_state,
+      ).toBe("new-attempt");
+    },
+  );
+
   it("deletes only the selected server and user pair", async () => {
     await repo.upsert({
       mcp_server_uuid: serverId,

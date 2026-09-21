@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import { OAuthError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
@@ -331,6 +331,17 @@ export const oauthImplementations = {
         ? registeredRedirectUris[0]
         : resolveRedirectUri();
 
+    // Claim atomically before any discovery/token request. The marker cannot
+    // parse as a callback state, and only this claim can consume or restore it.
+    const claimMarker = `upstream-claim.${randomBytes(32).toString("base64url")}`;
+    const claimed = await oauthSessionsRepository.compareAndSetExpectedState(
+      mcpServerUuid,
+      userId,
+      input.state,
+      claimMarker,
+    );
+    if (!claimed) return invalidState;
+
     let tokens: OAuthTokens;
     try {
       const { tokenEndpoint, discovered, resource } =
@@ -361,24 +372,25 @@ export const oauthImplementations = {
         resource,
       });
     } catch (error) {
+      // Restore retryable attempts only while our claim is still current. A
+      // newer authorize call may have replaced it while the request was pending.
+      const terminal =
+        error instanceof UpstreamTokenError &&
+        error.status >= 400 &&
+        error.status < 500 &&
+        error.status !== 408 &&
+        error.status !== 429 &&
+        error.oauthError &&
+        !["temporarily_unavailable", "server_error"].includes(
+          error.oauthError.error,
+        );
+      await oauthSessionsRepository.compareAndSetExpectedState(
+        mcpServerUuid,
+        userId,
+        claimMarker,
+        terminal ? null : input.state,
+      );
       if (error instanceof UpstreamTokenError) {
-        // Terminal authorization errors require a new authorize flow. Preserve
-        // the nonce for rate limiting, server failures and transient errors.
-        if (
-          error.status >= 400 &&
-          error.status < 500 &&
-          error.status !== 408 &&
-          error.status !== 429 &&
-          error.oauthError &&
-          !["temporarily_unavailable", "server_error"].includes(
-            error.oauthError.error,
-          )
-        ) {
-          await oauthSessionsRepository.clearExpectedState(
-            mcpServerUuid,
-            userId,
-          );
-        }
         logger.warn(
           `[oauth] upstream token exchange failed — server=${mcpServerUuid} ` +
             `status=${error.status} error=${error.oauthError?.error ?? "unknown"}`,
@@ -406,8 +418,14 @@ export const oauthImplementations = {
       tokens,
     });
 
-    // Fail closed: do not report success if consuming the nonce failed.
-    await oauthSessionsRepository.clearExpectedState(mcpServerUuid, userId);
+    // Database errors fail closed. A false CAS means a newer authorize attempt
+    // has superseded this claim; preserve that newer state.
+    await oauthSessionsRepository.compareAndSetExpectedState(
+      mcpServerUuid,
+      userId,
+      claimMarker,
+      null,
+    );
 
     logger.info(
       `[oauth] token exchange succeeded — server=${mcpServerUuid} ` +

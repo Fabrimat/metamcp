@@ -2,7 +2,7 @@ import {
   auth,
   type OAuthDiscoveryState,
 } from "@modelcontextprotocol/sdk/client/auth.js";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../db/repositories", () => ({
   oauthSessionsRepository: {
@@ -19,7 +19,13 @@ const SERVER = "00000000-0000-4000-8000-000000000003";
 const USER = "user-a";
 
 describe("OAuthUpstreamClientProvider user-scoped persistence", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () => new Response("No resource metadata", { status: 404 }),
+    );
+  });
+  afterEach(() => vi.restoreAllMocks());
 
   const load = async () => {
     const repositories = await import("../../db/repositories");
@@ -90,8 +96,8 @@ describe("OAuthUpstreamClientProvider user-scoped persistence", () => {
       authorizationServerMetadata: {
         token_endpoint: "https://configured.example/token",
       },
-      resourceMetadata: { resource: "https://mcp.example.com/mcp" },
     });
+    expect((await provider.discoveryState())?.resourceMetadata).toBeUndefined();
   });
 
   it("persists pre-registered discovery when preparing an authorization redirect", async () => {
@@ -104,17 +110,54 @@ describe("OAuthUpstreamClientProvider user-scoped persistence", () => {
       },
     });
     await auth(provider, { serverUrl: "https://mcp.example.com/mcp" });
+    expect(provider.authorizationUrl?.searchParams.get("resource")).toBe(null);
+    expect(upsert).toHaveBeenCalledWith({
+      mcp_server_uuid: SERVER,
+      user_id: USER,
+      discovery_state: expect.objectContaining({
+        authorizationServerUrl: "https://configured.example",
+      }),
+    });
+    const persisted = upsert.mock.calls.find(
+      ([input]) => input.discovery_state,
+    )?.[0].discovery_state;
+    expect(persisted.resourceMetadata).toBeUndefined();
+  });
+
+  it("preserves genuine persisted resource metadata when overriding authorization endpoints", async () => {
+    const { provider, findByMcpServerAndUser, upsert } = await load();
+    const resourceMetadata = {
+      resource: "https://mcp.example.com/",
+      scopes_supported: ["read"],
+    };
+    findByMcpServerAndUser.mockResolvedValue({
+      client_information: {
+        client_id: "client",
+        authorization_endpoint: "https://configured.example/authorize",
+        token_endpoint: "https://configured.example/token",
+      },
+      discovery_state: {
+        authorizationServerUrl: "https://stale.example",
+        resourceMetadata,
+        resourceMetadataUrl:
+          "https://mcp.example.com/.well-known/oauth-protected-resource",
+      },
+    });
+    await auth(provider, { serverUrl: "https://mcp.example.com/mcp" });
     expect(provider.authorizationUrl?.searchParams.get("resource")).toBe(
-      "https://mcp.example.com/mcp",
+      "https://mcp.example.com/",
     );
     expect(upsert).toHaveBeenCalledWith({
       mcp_server_uuid: SERVER,
       user_id: USER,
       discovery_state: expect.objectContaining({
         authorizationServerUrl: "https://configured.example",
-        resourceMetadata: { resource: "https://mcp.example.com/mcp" },
+        resourceMetadata,
+        resourceMetadataUrl:
+          "https://mcp.example.com/.well-known/oauth-protected-resource",
       }),
     });
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("fails SDK authorization when cached protected resource metadata is incompatible", async () => {

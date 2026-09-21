@@ -56,7 +56,6 @@ function clientInfoAsRecord(ci: unknown): Record<string, unknown> | null {
 export class OAuthUpstreamClientProvider implements OAuthClientProvider {
   private readonly mcpServerUuid: string;
   private readonly userId: string;
-  private readonly serverUrl: string;
   private readonly redirectUriOverride: string | null;
 
   // Populated by redirectToAuthorization() instead of navigating — see
@@ -67,7 +66,6 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
   constructor(options: OAuthUpstreamClientProviderOptions) {
     this.mcpServerUuid = options.mcpServerUuid;
     this.userId = options.userId;
-    this.serverUrl = options.serverUrl;
     this.redirectUriOverride = options.redirectUriOverride;
   }
 
@@ -209,9 +207,8 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
   // never clientInformation.authorization_endpoint, so without this the
   // field only ever affected the (already server-side) token-exchange path.
   //
-  // Also synthesizes a minimal `resourceMetadata` (just the `resource`
-  // field) to avoid discovery for explicitly configured endpoints. The SDK
-  // validates and selects this resource for authorize, exchange and refresh.
+  // Resource metadata is retained only when actually discovered. Without it,
+  // the SDK can discover PRM; no artificial resource indicator is introduced.
   //
   // Complete pre-registered endpoints take precedence, followed by persisted
   // discovery. With neither available, the SDK performs normal discovery.
@@ -240,6 +237,9 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
     }
 
     return {
+      ...(session?.discovery_state as unknown as
+        | OAuthDiscoveryState
+        | undefined),
       authorizationServerUrl,
       authorizationServerMetadata: {
         issuer: authorizationServerUrl,
@@ -247,7 +247,6 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
         token_endpoint: tokenEndpoint,
         response_types_supported: ["code"],
       },
-      resourceMetadata: { resource: this.serverUrl },
     };
   }
 
