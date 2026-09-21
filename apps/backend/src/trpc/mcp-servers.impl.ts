@@ -41,6 +41,14 @@ export const mcpServersImplementations = {
 
       const createdServer = await mcpServersRepository.create({
         ...serverInput,
+        // redirect_uri lives on oauth_client_info in the request shape (it's
+        // set alongside the other pre-registered OAuth fields in the UI) but
+        // is persisted as its own mcp_servers column rather than inside
+        // oauth_sessions.client_information — see pre-registered-oauth.ts
+        // for why (persistPreRegisteredOAuthClient only writes
+        // client_information when client_id is set, which would silently
+        // drop a redirect_uri-only override for DCR-only upstreams).
+        redirect_uri: oauthClientInfo?.redirect_uri?.trim() || null,
         user_id: effectiveUserId,
       });
 
@@ -58,6 +66,7 @@ export const mcpServersImplementations = {
         try {
           await persistPreRegisteredOAuthClient(
             createdServer.uuid,
+            userId,
             oauthClientInfo,
             oauthSessionsRepository,
           );
@@ -77,7 +86,7 @@ export const mcpServersImplementations = {
       }
 
       // Ensure idle session for the newly created server (async)
-      const serverParams = await convertDbServerToParams(createdServer);
+      const serverParams = await convertDbServerToParams(createdServer, userId);
       if (serverParams) {
         mcpServerPool
           .ensureIdleSessionForNewServer(createdServer.uuid, serverParams)
@@ -184,7 +193,7 @@ export const mcpServersImplementations = {
         if (createdServers && createdServers.length > 0) {
           createdServers.forEach(async (server) => {
             try {
-              const params = await convertDbServerToParams(server);
+              const params = await convertDbServerToParams(server, userId);
               if (params) {
                 mcpServerPool
                   .ensureIdleSessionForNewServer(server.uuid, params)
@@ -396,6 +405,14 @@ export const mcpServersImplementations = {
 
       const updatedServer = await mcpServersRepository.update({
         ...serverInput,
+        // Only touch redirect_uri when the OAuth section was actually part
+        // of this request (oauthClientInfo present) — mirrors the
+        // dirty-field gating the edit form applies before including
+        // oauth_client_info at all, so an unrelated edit (e.g. renaming the
+        // server) cannot silently clear an existing override.
+        ...(oauthClientInfo !== undefined && {
+          redirect_uri: oauthClientInfo?.redirect_uri?.trim() || null,
+        }),
         user_id: effectiveUserId,
       });
 
@@ -408,10 +425,19 @@ export const mcpServersImplementations = {
 
       if (oauthClientInfo) {
         try {
+          // `server.redirect_uri` (fetched above, BEFORE this update) is
+          // passed through so persistPreRegisteredOAuthClient can tell
+          // whether the override actually changed and invalidate any
+          // stale persisted registration — see the parameter's doc comment
+          // there for why that decision (and the delete) must happen
+          // inside that function, after it persists this call's own
+          // client_information, rather than as a separate step here.
           await persistPreRegisteredOAuthClient(
             updatedServer.uuid,
+            userId,
             oauthClientInfo,
             oauthSessionsRepository,
+            server.redirect_uri,
           );
         } catch (error) {
           logger.error(
@@ -444,7 +470,7 @@ export const mcpServersImplementations = {
       }
 
       // Invalidate idle session for the updated server to refresh with new parameters (async)
-      const serverParams = await convertDbServerToParams(updatedServer);
+      const serverParams = await convertDbServerToParams(updatedServer, userId);
       if (serverParams) {
         mcpServerPool
           .invalidateIdleSession(updatedServer.uuid, serverParams)

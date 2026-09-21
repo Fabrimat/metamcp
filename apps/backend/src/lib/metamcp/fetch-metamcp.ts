@@ -9,7 +9,11 @@ import logger from "@/utils/logger";
 
 import { db } from "../../db/index";
 import { oauthSessionsRepository } from "../../db/repositories/index";
-import { mcpServersTable, namespaceServerMappingsTable } from "../../db/schema";
+import {
+  mcpServersTable,
+  namespaceServerMappingsTable,
+  namespacesTable,
+} from "../../db/schema";
 import { getDefaultEnvironment } from "./utils";
 
 // Define IOType for stderr handling
@@ -57,20 +61,28 @@ export async function getMcpServers(
         forward_headers: mcpServersTable.forward_headers,
         status: namespaceServerMappingsTable.status,
         error_status: mcpServersTable.error_status,
+        oauth_user_id: namespacesTable.user_id,
       })
       .from(mcpServersTable)
       .innerJoin(
         namespaceServerMappingsTable,
         eq(mcpServersTable.uuid, namespaceServerMappingsTable.mcp_server_uuid),
       )
+      .innerJoin(
+        namespacesTable,
+        eq(namespacesTable.uuid, namespaceServerMappingsTable.namespace_uuid),
+      )
       .where(and(...whereConditions));
 
     const serverDict: Record<string, ServerParameters> = {};
     for (const server of servers) {
       // Fetch OAuth tokens from OAuth sessions table
-      const oauthSession = await oauthSessionsRepository.findByMcpServerUuid(
-        server.uuid,
-      );
+      const oauthSession = server.oauth_user_id
+        ? await oauthSessionsRepository.findByMcpServerAndUser(
+            server.uuid,
+            server.oauth_user_id,
+          )
+        : undefined;
       let oauthTokens = null;
 
       if (oauthSession && oauthSession.tokens) {
@@ -78,6 +90,12 @@ export async function getMcpServers(
           access_token: oauthSession.tokens.access_token,
           token_type: oauthSession.tokens.token_type,
           expires_in: oauthSession.tokens.expires_in,
+          // This is a field-by-field copy, not a spread — new fields on
+          // the persisted tokens (like this one) must be added here
+          // explicitly or they silently never reach ServerParameters.
+          // Without it, client.ts's proactive-refresh gate always sees
+          // expires_at as undefined and never fires.
+          expires_at: oauthSession.tokens.expires_at,
           scope: oauthSession.tokens.scope,
           refresh_token: oauthSession.tokens.refresh_token,
         };
@@ -100,6 +118,7 @@ export async function getMcpServers(
         error_status: server.error_status?.toLowerCase(),
         stderr: "inherit" as IOType,
         oauth_tokens: oauthTokens,
+        oauth_user_id: server.oauth_user_id,
         bearerToken: server.bearerToken,
       };
 

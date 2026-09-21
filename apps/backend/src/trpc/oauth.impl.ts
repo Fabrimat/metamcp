@@ -1,3 +1,5 @@
+import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
+import { OAuthError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { OAuthClientInformation } from "@modelcontextprotocol/sdk/shared/auth.js";
 import {
   ExchangeOAuthTokenRequestSchema,
@@ -6,6 +8,8 @@ import {
   GetOAuthSessionResponseSchema,
   RefreshOAuthTokenRequestSchema,
   RefreshOAuthTokenResponseSchema,
+  StartOAuthAuthorizationRequestSchema,
+  StartOAuthAuthorizationResponseSchema,
   UpsertOAuthSessionRequestSchema,
   UpsertOAuthSessionResponseSchema,
 } from "@repo/zod-types";
@@ -18,6 +22,7 @@ import {
   oauthSessionsRepository,
 } from "../db/repositories";
 import { OAuthSessionsSerializer } from "../db/serializers";
+import { OAuthUpstreamClientProvider } from "../lib/oauth-upstream/provider";
 import { tryRefreshUpstreamTokens } from "../lib/oauth-upstream/refresh-on-401";
 import {
   discoverAuthorizationServerMetadata,
@@ -27,10 +32,21 @@ import {
   resolveTokenEndpoint,
   resolveTokenEndpointAuthMethod,
   UpstreamTokenError,
+  withExpiresAt,
 } from "../lib/oauth-upstream/token-exchange";
 
-// The redirect_uri passed in the token request MUST byte-match the one the
-// SDK sent on the /authorize call. The frontend computes it as
+// Fallback used ONLY when the persisted client_information has no
+// redirect_uris[0] (e.g. a session that predates this field). Whenever
+// client_information.redirect_uris[0] IS present, the caller uses that
+// value directly instead of this function — see the `redirectUri`
+// resolution below — because it is byte-identical to whatever was actually
+// sent at registration/authorize (including a per-server loopback
+// override), which recomputing from APP_URL here cannot guarantee: the
+// frontend derives its callback from NEXT_PUBLIC_APP_URL ||
+// window.location.origin while this function reads APP_URL, and the two
+// can diverge.
+//
+// The frontend computes its default callback as
 // `getAppUrl() + "/fe-oauth/callback"` with no normalization
 // (apps/frontend/lib/oauth-provider.ts), so we mirror that verbatim — no
 // trailing-slash stripping. If APP_URL ends in a slash, both sides produce
@@ -122,15 +138,30 @@ async function resolveOwnedServerUrl(
 export const oauthImplementations = {
   get: async (
     input: z.infer<typeof GetOAuthSessionRequestSchema>,
+    userId: string,
   ): Promise<z.infer<typeof GetOAuthSessionResponseSchema>> => {
     try {
-      const session = await oauthSessionsRepository.findByMcpServerUuid(
+      const serverResolution = await resolveOwnedServerUrl(
         input.mcp_server_uuid,
+        userId,
+      );
+      if (!serverResolution.ok) {
+        return {
+          success: false as const,
+          error: serverResolution.error.error,
+          message: serverResolution.error.error_description,
+        };
+      }
+
+      const session = await oauthSessionsRepository.findByMcpServerAndUser(
+        input.mcp_server_uuid,
+        userId,
       );
 
       if (!session) {
         return {
           success: false as const,
+          error: "session_not_found",
           message: "OAuth session not found",
         };
       }
@@ -144,6 +175,7 @@ export const oauthImplementations = {
       logger.error("Error fetching OAuth session:", error);
       return {
         success: false as const,
+        error: "internal_error",
         message: "Failed to fetch OAuth session",
       };
     }
@@ -151,10 +183,23 @@ export const oauthImplementations = {
 
   upsert: async (
     input: z.infer<typeof UpsertOAuthSessionRequestSchema>,
+    userId: string,
   ): Promise<z.infer<typeof UpsertOAuthSessionResponseSchema>> => {
     try {
+      const serverResolution = await resolveOwnedServerUrl(
+        input.mcp_server_uuid,
+        userId,
+      );
+      if (!serverResolution.ok) {
+        return {
+          success: false as const,
+          error: serverResolution.error.error,
+        };
+      }
+
       const session = await oauthSessionsRepository.upsert({
         mcp_server_uuid: input.mcp_server_uuid,
+        user_id: userId,
         ...(input.client_information && {
           client_information: input.client_information,
         }),
@@ -215,8 +260,9 @@ export const oauthImplementations = {
     }
     const serverUrl = serverResolution.url;
 
-    const session = await oauthSessionsRepository.findByMcpServerUuid(
+    const session = await oauthSessionsRepository.findByMcpServerAndUser(
       input.mcp_server_uuid,
+      userId,
     );
     if (!session) {
       return {
@@ -298,7 +344,20 @@ export const oauthImplementations = {
       hasSecret: Boolean(clientSecret),
     });
 
-    const redirectUri = resolveRedirectUri();
+    // Use the redirect_uri that was actually registered/authorized rather
+    // than recomputing it — this is the byte-identical guarantee RFC 6749
+    // §4.1.3 requires between the /authorize and token-exchange requests,
+    // and it automatically carries a per-server loopback override (see
+    // pre-registered-oauth.ts) without this function needing to know about
+    // it. Falls back to the APP_URL derivation for sessions whose
+    // client_information predates this field.
+    const registeredRedirectUris = clientInformation?.redirect_uris;
+    const redirectUri =
+      Array.isArray(registeredRedirectUris) &&
+      typeof registeredRedirectUris[0] === "string" &&
+      registeredRedirectUris[0].length > 0
+        ? registeredRedirectUris[0]
+        : resolveRedirectUri();
 
     logger.info(
       `[oauth] exchanging code for tokens — server=${input.mcp_server_uuid} ` +
@@ -335,8 +394,14 @@ export const oauthImplementations = {
       throw error;
     }
 
+    // Compute the absolute expiry NOW, at the moment the response was
+    // received, so the proactive-refresh gate in client.ts has something
+    // to act on. See withExpiresAt's doc comment for why.
+    tokens = withExpiresAt(tokens);
+
     await oauthSessionsRepository.upsert({
       mcp_server_uuid: input.mcp_server_uuid,
+      user_id: userId,
       tokens,
     });
 
@@ -351,7 +416,10 @@ export const oauthImplementations = {
     // clearing, so the user can retry the exchange without re-running the
     // authorize flow.
     try {
-      await oauthSessionsRepository.clearExpectedState(input.mcp_server_uuid);
+      await oauthSessionsRepository.clearExpectedState(
+        input.mcp_server_uuid,
+        userId,
+      );
     } catch (clearError) {
       // Logging only — the exchange itself already succeeded and a stale
       // expected_state will be overwritten on the next authorize attempt.
@@ -396,11 +464,14 @@ export const oauthImplementations = {
       return { success: false as const, ...serverResolution.error };
     }
 
-    const result = await tryRefreshUpstreamTokens({
-      uuid: input.mcp_server_uuid,
-      name: "frontend-refresh",
-      url: serverResolution.url,
-    });
+    const result = await tryRefreshUpstreamTokens(
+      {
+        uuid: input.mcp_server_uuid,
+        name: "frontend-refresh",
+        url: serverResolution.url,
+      },
+      userId,
+    );
 
     switch (result.status) {
       case "refreshed":
@@ -432,6 +503,143 @@ export const oauthImplementations = {
           error_description: result.errorDescription,
           upstream_status: result.upstreamStatus,
         };
+    }
+  },
+
+  // Server-side authorize-URL construction. Runs discovery, dynamic client
+  // registration (or uses pre-registered endpoints — see
+  // OAuthUpstreamClientProvider.discoveryState), PKCE, and `state`
+  // generation entirely server-side via the MCP SDK's `auth()`
+  // orchestrator, then returns the resulting authorize URL for the
+  // frontend to navigate the browser to. Same CORS rationale as
+  // exchangeToken/refreshToken above: some upstreams (verified against
+  // Reclaim.ai) don't set CORS headers on discovery or DCR endpoints, so
+  // the browser-side DbOAuthClientProvider
+  // (apps/frontend/lib/oauth-provider.ts) can never complete those steps
+  // for them.
+  startAuthorization: async (
+    input: z.infer<typeof StartOAuthAuthorizationRequestSchema>,
+    userId: string,
+  ): Promise<z.infer<typeof StartOAuthAuthorizationResponseSchema>> => {
+    // Same SSRF guard as exchangeToken/refreshToken: the upstream URL is
+    // resolved from the DB, never from the caller.
+    const serverResolution = await resolveOwnedServerUrl(
+      input.mcp_server_uuid,
+      userId,
+    );
+    if (!serverResolution.ok) {
+      return { success: false as const, ...serverResolution.error };
+    }
+    const serverUrl = serverResolution.url;
+
+    // resolveOwnedServerUrl already confirmed this row exists and is
+    // owned by `userId` — fetched again here only for the `redirect_uri`
+    // column, which that helper doesn't expose.
+    const server = await mcpServersRepository.findByUuid(input.mcp_server_uuid);
+
+    const provider = new OAuthUpstreamClientProvider({
+      mcpServerUuid: input.mcp_server_uuid,
+      userId,
+      serverUrl,
+      redirectUriOverride: server?.redirect_uri ?? null,
+    });
+
+    // SEP-835 scope selection: pass the user's pre-registered scope (if
+    // any) as `options.scope` so it takes precedence exactly as the SDK
+    // intends — auth()'s precedence is options.scope > PRM
+    // scopes_supported > clientMetadata.scope, and our clientMetadata
+    // never carries a scope, so this is the only way a pre-registered
+    // scope reaches DCR/authorize.
+    const session = await oauthSessionsRepository.findByMcpServerAndUser(
+      input.mcp_server_uuid,
+      userId,
+    );
+    const clientInformation = clientInfoAsRecord(session?.client_information);
+    const scope =
+      typeof clientInformation?.scope === "string" &&
+      clientInformation.scope.length > 0
+        ? clientInformation.scope
+        : undefined;
+
+    try {
+      const result = await auth(provider, { serverUrl, scope });
+      if (result !== "REDIRECT" || !provider.authorizationUrl) {
+        // auth() only resolves 'AUTHORIZED' when tokens() returns a value
+        // or redirectUrl is falsy — neither is possible for this provider
+        // (see provider.ts). Defensive: something changed upstream in the
+        // SDK, or a future refactor broke that invariant.
+        logger.error(
+          `[oauth] startAuthorization: auth() returned '${result}' without ` +
+            `an authorization URL for server=${input.mcp_server_uuid}`,
+        );
+        return {
+          success: false as const,
+          error: "unexpected_auth_result",
+          error_description:
+            "Could not build an authorize URL for this server.",
+        };
+      }
+      // SECURITY: reject a non-http(s) authorize URL before ever returning
+      // it. The frontend (mcp-servers/[uuid]/page.tsx) assigns
+      // `authorization_url` directly to `window.location.href`, and this
+      // URL is built by the MCP SDK from the upstream's discovered or
+      // pre-registered authorization_endpoint — data controlled by
+      // whoever configured this mcp_servers row, not by MetaMCP. zod's
+      // `.url()` on the response schema accepts `javascript:` (it's a
+      // syntactically valid URL), so nothing upstream of this check
+      // constrains the scheme. `provider.authorizationUrl` is already a
+      // `URL` (built via `new URL(...)` inside the SDK's
+      // startAuthorization — see client/auth.js), so checking `.protocol`
+      // here is equivalent to parsing the string ourselves, without
+      // regexing it.
+      if (
+        provider.authorizationUrl.protocol !== "http:" &&
+        provider.authorizationUrl.protocol !== "https:"
+      ) {
+        logger.error(
+          `[oauth] startAuthorization: rejected non-http(s) authorization URL ` +
+            `scheme '${provider.authorizationUrl.protocol}' for server=${input.mcp_server_uuid}`,
+        );
+        return {
+          success: false as const,
+          error: "unsafe_authorization_url",
+          error_description:
+            "The upstream's authorization endpoint uses a URL scheme MetaMCP does not allow.",
+        };
+      }
+
+      logger.info(
+        `[oauth] startAuthorization succeeded — server=${input.mcp_server_uuid}`,
+      );
+      return {
+        success: true as const,
+        data: { authorization_url: provider.authorizationUrl.href },
+        message: "Authorization URL created",
+      };
+    } catch (error) {
+      // Discovery/DCR failures throw MCP SDK OAuthError subclasses (e.g.
+      // Reclaim.ai rejecting a non-loopback redirect_uri with
+      // `invalid_redirect_uri`). Surface the upstream's own error code +
+      // message rather than a generic 500 — it's the user's main
+      // diagnostic for fixing their server config.
+      if (error instanceof OAuthError) {
+        logger.warn(
+          `[oauth] startAuthorization failed — server=${input.mcp_server_uuid} ` +
+            `error=${error.errorCode}`,
+        );
+        return {
+          success: false as const,
+          error: error.errorCode,
+          error_description: error.message,
+        };
+      }
+      // Any other thrown value is a programmer bug, not an upstream
+      // issue — same convention as exchangeToken above.
+      logger.error(
+        `[oauth] startAuthorization unexpected error for server ${input.mcp_server_uuid}:`,
+        error,
+      );
+      throw error;
     }
   },
 };

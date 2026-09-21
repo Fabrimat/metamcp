@@ -84,12 +84,17 @@ export function sanitizeName(name: string): string {
  */
 export async function convertDbServerToParams(
   server: DatabaseMcpServer,
+  userId?: string,
 ): Promise<ServerParameters | null> {
   try {
+    const oauthUserId = userId ?? server.user_id ?? undefined;
     // Fetch OAuth tokens from OAuth sessions table
-    const oauthSession = await oauthSessionsRepository.findByMcpServerUuid(
-      server.uuid,
-    );
+    const oauthSession = oauthUserId
+      ? await oauthSessionsRepository.findByMcpServerAndUser(
+          server.uuid,
+          oauthUserId,
+        )
+      : undefined;
     let oauthTokens = null;
 
     if (oauthSession && oauthSession.tokens) {
@@ -97,6 +102,12 @@ export async function convertDbServerToParams(
         access_token: oauthSession.tokens.access_token,
         token_type: oauthSession.tokens.token_type,
         expires_in: oauthSession.tokens.expires_in,
+        // Field-by-field copy, not a spread — see the matching comment in
+        // fetch-metamcp.ts's getMcpServers. Without this, servers warmed
+        // up via this path (startup.ts idle-session init, mcp-servers
+        // create/update) never carry expires_at into ServerParameters, so
+        // client.ts's proactive-refresh gate never fires for them.
+        expires_at: oauthSession.tokens.expires_at,
         scope: oauthSession.tokens.scope,
         refresh_token: oauthSession.tokens.refresh_token,
       };
@@ -115,6 +126,7 @@ export async function convertDbServerToParams(
       status: "active", // Default status for non-namespace servers
       stderr: "inherit" as const,
       oauth_tokens: oauthTokens,
+      oauth_user_id: oauthUserId,
       bearerToken: server.bearerToken,
       headers: server.headers || {},
       forward_headers: server.forward_headers || {},

@@ -8,8 +8,8 @@
 // persists the new tokens back into the DB so the next connection attempt
 // picks them up.
 //
-// Concurrency: an in-process per-server mutex (`inFlightRefreshes`)
-// collapses simultaneous refresh attempts for the same MCP server into
+// Concurrency: an in-process per-server-and-user mutex (`inFlightRefreshes`)
+// collapses simultaneous refresh attempts for the same OAuth session into
 // one upstream POST. Without this, providers that rotate refresh tokens
 // (Google, Microsoft, Okta with rotation enabled) would consume the
 // refresh_token on the first attempt and reject the second with
@@ -32,6 +32,7 @@ import {
   resolveTokenEndpoint,
   resolveTokenEndpointAuthMethod,
   UpstreamTokenError,
+  withExpiresAt,
 } from "./token-exchange";
 
 export interface RefreshResult {
@@ -47,8 +48,8 @@ export interface RefreshResult {
   upstreamStatus?: number;
 }
 
-// Per-server in-flight refresh promises. Concurrent callers for the same
-// MCP server share the same upstream POST instead of racing on rotating
+// Per-session in-flight refresh promises. Concurrent callers for the same
+// server-and-user pair share the same upstream POST instead of racing on rotating
 // refresh tokens. The map is cleared in a `finally` so a refresh failure
 // doesn't permanently pin the server. Exposed for tests; do not depend on
 // it from production code.
@@ -61,8 +62,13 @@ export const inFlightRefreshes = new Map<string, Promise<RefreshResult>>();
 // when there is no refresh_token or no client_id to use.
 export async function tryRefreshUpstreamTokens(
   serverParams: Pick<ServerParameters, "uuid" | "name" | "url">,
+  userId?: string,
 ): Promise<RefreshResult> {
-  const inFlight = inFlightRefreshes.get(serverParams.uuid);
+  if (!userId) {
+    return { status: "no_session" };
+  }
+  const refreshKey = `${serverParams.uuid}:${userId}`;
+  const inFlight = inFlightRefreshes.get(refreshKey);
   if (inFlight) {
     logger.info(
       `[oauth] refresh already in flight for ${serverParams.uuid}; joining`,
@@ -71,24 +77,26 @@ export async function tryRefreshUpstreamTokens(
   }
   const promise = (async () => {
     try {
-      return await doRefresh(serverParams);
+      return await doRefresh(serverParams, userId);
     } finally {
-      inFlightRefreshes.delete(serverParams.uuid);
+      inFlightRefreshes.delete(refreshKey);
     }
   })();
-  inFlightRefreshes.set(serverParams.uuid, promise);
+  inFlightRefreshes.set(refreshKey, promise);
   return promise;
 }
 
 async function doRefresh(
   serverParams: Pick<ServerParameters, "uuid" | "name" | "url">,
+  userId: string,
 ): Promise<RefreshResult> {
   if (!serverParams.url) {
     return { status: "no_session" };
   }
 
-  const session = await oauthSessionsRepository.findByMcpServerUuid(
+  const session = await oauthSessionsRepository.findByMcpServerAndUser(
     serverParams.uuid,
+    userId,
   );
   if (!session) {
     return { status: "no_session" };
@@ -174,8 +182,14 @@ async function doRefresh(
     };
   }
 
+  // Compute the absolute expiry NOW, at the moment the response was
+  // received, so the proactive-refresh gate in client.ts has something to
+  // act on next time around. See withExpiresAt's doc comment for why.
+  newTokens = withExpiresAt(newTokens);
+
   await oauthSessionsRepository.upsert({
     mcp_server_uuid: serverParams.uuid,
+    user_id: userId,
     tokens: newTokens,
   });
 

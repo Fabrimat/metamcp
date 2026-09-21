@@ -5,6 +5,8 @@ import {
   GetOAuthSessionResponseSchema,
   RefreshOAuthTokenRequestSchema,
   RefreshOAuthTokenResponseSchema,
+  StartOAuthAuthorizationRequestSchema,
+  StartOAuthAuthorizationResponseSchema,
   UpsertOAuthSessionRequestSchema,
   UpsertOAuthSessionResponseSchema,
 } from "@repo/zod-types";
@@ -19,9 +21,11 @@ export const createOAuthRouter = (
   implementations: {
     get: (
       input: z.infer<typeof GetOAuthSessionRequestSchema>,
+      userId: string,
     ) => Promise<z.infer<typeof GetOAuthSessionResponseSchema>>;
     upsert: (
       input: z.infer<typeof UpsertOAuthSessionRequestSchema>,
+      userId: string,
     ) => Promise<z.infer<typeof UpsertOAuthSessionResponseSchema>>;
     exchangeToken: (
       input: z.infer<typeof ExchangeOAuthTokenRequestSchema>,
@@ -31,6 +35,10 @@ export const createOAuthRouter = (
       input: z.infer<typeof RefreshOAuthTokenRequestSchema>,
       userId: string,
     ) => Promise<z.infer<typeof RefreshOAuthTokenResponseSchema>>;
+    startAuthorization: (
+      input: z.infer<typeof StartOAuthAuthorizationRequestSchema>,
+      userId: string,
+    ) => Promise<z.infer<typeof StartOAuthAuthorizationResponseSchema>>;
   },
 ) => {
   return router({
@@ -38,16 +46,16 @@ export const createOAuthRouter = (
     get: protectedProcedure
       .input(GetOAuthSessionRequestSchema)
       .output(GetOAuthSessionResponseSchema)
-      .query(async ({ input }) => {
-        return await implementations.get(input);
+      .query(async ({ input, ctx }) => {
+        return await implementations.get(input, ctx.user.id);
       }),
 
     // Protected: Upsert OAuth session
     upsert: protectedProcedure
       .input(UpsertOAuthSessionRequestSchema)
       .output(UpsertOAuthSessionResponseSchema)
-      .mutation(async ({ input }) => {
-        return await implementations.upsert(input);
+      .mutation(async ({ input, ctx }) => {
+        return await implementations.upsert(input, ctx.user.id);
       }),
 
     // Protected: Server-side authorization-code-to-tokens exchange. This
@@ -72,6 +80,16 @@ export const createOAuthRouter = (
       .output(RefreshOAuthTokenResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.refreshToken(input, ctx.user.id);
+      }),
+
+    // Protected: server-side authorize-URL construction (discovery + DCR +
+    // PKCE + state, all server-to-server). Same ownership-check
+    // requirement as exchangeToken/refreshToken above.
+    startAuthorization: protectedProcedure
+      .input(StartOAuthAuthorizationRequestSchema)
+      .output(StartOAuthAuthorizationResponseSchema)
+      .mutation(async ({ input, ctx }) => {
+        return await implementations.startAuthorization(input, ctx.user.id);
       }),
   });
 };

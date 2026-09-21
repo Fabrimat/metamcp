@@ -10,7 +10,10 @@ import logger from "@/utils/logger";
 import { oauthSessionsRepository } from "../../db/repositories";
 import { tryRefreshUpstreamTokens } from "../oauth-upstream/refresh-on-401";
 import { recoverFromPostAuthRace } from "../oauth-upstream/retry-post-auth";
-import { isUpstreamUnauthorizedError } from "../oauth-upstream/token-exchange";
+import {
+  isUpstreamUnauthorizedError,
+  redactToken,
+} from "../oauth-upstream/token-exchange";
 import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
 import { metamcpLogStore } from "./log-store";
 import { serverErrorTracker } from "./server-error-tracker";
@@ -18,6 +21,12 @@ import { resolveEnvVariables } from "./utils";
 
 const sleep = (time: number) =>
   new Promise<void>((resolve) => setTimeout(() => resolve(), time));
+
+// Clock-skew buffer for the proactive-refresh gate below. Providers issue
+// short-lived access tokens; this bounds how early we refresh so a token
+// that is technically still valid but about to expire mid-handshake
+// doesn't get used to build a transport that immediately 401s/403s.
+const EXPIRY_REFRESH_BUFFER_MS = 60_000;
 
 export interface ConnectedClient {
   client: Client;
@@ -162,6 +171,96 @@ export const createMetaMcpClient = (
   return { client, transport };
 };
 
+// Expiry-driven proactive refresh — runs BEFORE createMetaMcpClient builds
+// the transport (and its `Authorization: Bearer` header), so an
+// about-to-expire access_token never goes out on the wire in the first
+// place.
+//
+// Why this exists alongside the reactive 401-refresh cascade further down
+// in connectMetaMcpClient: that cascade is status-code-based, and status
+// codes are not a reliable signal for every upstream. Reclaim.ai's /mcp
+// returns a bare HTTP 403 — no WWW-Authenticate header, no OAuth error
+// envelope — for BOTH an expired access_token and a genuine permission
+// denial (verified live). `isUpstreamUnauthorizedError` deliberately does
+// NOT treat a bare 403 as an auth error (a pinned test enforces this,
+// because treating every 403 as one would burn rotating refresh tokens on
+// real permission denials), so the reactive cascade never fires for that
+// class of upstream — an expired token just sits there silently. Refresh
+// for those upstreams has to be driven by the persisted expiry, before
+// the request goes out, since no status code ever arrives to trigger it.
+//
+// Deliberately cheap on the common path: STDIO servers, servers with no
+// known expires_at, and servers with no refresh_token all return on the
+// first failing check below with no DB or network call.
+export async function refreshIfExpiringSoon(
+  serverParams: ServerParameters,
+): Promise<void> {
+  const isHttpServer =
+    serverParams.type === "SSE" || serverParams.type === "STREAMABLE_HTTP";
+  const tokens = serverParams.oauth_tokens;
+  if (
+    !isHttpServer ||
+    !tokens?.refresh_token ||
+    typeof tokens.expires_at !== "number" ||
+    tokens.expires_at - Date.now() >= EXPIRY_REFRESH_BUFFER_MS
+  ) {
+    return;
+  }
+
+  logger.info(
+    `[oauth] access_token for ${serverParams.name} (${serverParams.uuid}) ` +
+      `expires within ${EXPIRY_REFRESH_BUFFER_MS}ms; refreshing proactively ` +
+      `before connecting`,
+  );
+
+  // A refresh failure must NOT block the connection attempt — proceed with
+  // the existing (possibly-expired) token below; it may still work (clock
+  // skew, an upstream that ignores its own expires_in), and failing closed
+  // here would turn a working server into a broken one over a transient
+  // refresh-endpoint hiccup. The reactive 401-refresh cascade further down
+  // is still there as a second line of defence if this attempt does 401.
+  try {
+    const refresh = await tryRefreshUpstreamTokens(
+      serverParams,
+      serverParams.oauth_user_id ?? undefined,
+    );
+    if (refresh.status === "refreshed" && refresh.tokens) {
+      serverParams.oauth_tokens = {
+        access_token: refresh.tokens.access_token,
+        token_type: refresh.tokens.token_type,
+        expires_in: refresh.tokens.expires_in,
+        expires_at: refresh.tokens.expires_at,
+        scope:
+          typeof refresh.tokens.scope === "string"
+            ? refresh.tokens.scope
+            : undefined,
+        refresh_token:
+          typeof refresh.tokens.refresh_token === "string"
+            ? refresh.tokens.refresh_token
+            : undefined,
+      };
+      logger.info(
+        `[oauth] proactive refresh succeeded for ${serverParams.name} ` +
+          `(${serverParams.uuid}); access_token=${redactToken(
+            refresh.tokens.access_token,
+          )}`,
+      );
+    } else {
+      logger.warn(
+        `[oauth] proactive refresh did not update tokens for ${serverParams.name} ` +
+          `(${serverParams.uuid}): ${refresh.status}${
+            refresh.error ? ` (${refresh.error})` : ""
+          }`,
+      );
+    }
+  } catch (error) {
+    logger.error(
+      `[oauth] proactive refresh threw for ${serverParams.name} (${serverParams.uuid}):`,
+      error,
+    );
+  }
+}
+
 export const connectMetaMcpClient = async (
   serverParams: ServerParameters,
   onProcessCrash?: (exitCode: number | null, signal: string | null) => void,
@@ -205,6 +304,13 @@ export const connectMetaMcpClient = async (
       const wasInErrorState = await serverErrorTracker.isServerInErrorState(
         serverParams.uuid,
       );
+
+      // Expiry-driven proactive refresh — must run before
+      // createMetaMcpClient builds the transport's Authorization header.
+      // See refreshIfExpiringSoon's doc comment for why the reactive
+      // 401-refresh cascade below cannot substitute for this on every
+      // upstream.
+      await refreshIfExpiringSoon(serverParams);
 
       const result = createMetaMcpClient(serverParams);
       client = result.client;
@@ -360,12 +466,21 @@ export const connectMetaMcpClient = async (
         isUpstreamUnauthorizedError(error)
       ) {
         try {
-          const refresh = await tryRefreshUpstreamTokens(serverParams);
+          const refresh = await tryRefreshUpstreamTokens(
+            serverParams,
+            serverParams.oauth_user_id ?? undefined,
+          );
           if (refresh.status === "refreshed" && refresh.tokens) {
             serverParams.oauth_tokens = {
               access_token: refresh.tokens.access_token,
               token_type: refresh.tokens.token_type,
               expires_in: refresh.tokens.expires_in,
+              // Without this, the cached ServerParameters this reactive
+              // path mutates in place (McpServerPool.serverParamsCache)
+              // would lose its expires_at after the FIRST 401-refresh,
+              // silently disabling the proactive gate above for that
+              // cached instance's later reconnects.
+              expires_at: refresh.tokens.expires_at,
               scope:
                 typeof refresh.tokens.scope === "string"
                   ? refresh.tokens.scope
@@ -407,9 +522,12 @@ export const connectMetaMcpClient = async (
       //    refuses 4xx-status errors as a second line of defence.
       if (isHttpServer) {
         try {
-          const session = await oauthSessionsRepository.findByMcpServerUuid(
-            serverParams.uuid,
-          );
+          const session = serverParams.oauth_user_id
+            ? await oauthSessionsRepository.findByMcpServerAndUser(
+                serverParams.uuid,
+                serverParams.oauth_user_id,
+              )
+            : undefined;
           // Approximation. `oauth_sessions.updated_at` is bumped by every
           // write to the row — token upserts (the signal we care about),
           // `state()` seeding `expected_state`, the post-success

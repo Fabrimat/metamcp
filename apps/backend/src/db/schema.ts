@@ -3,6 +3,7 @@ import {
   McpServerErrorStatusEnum,
   McpServerStatusEnum,
   McpServerTypeEnum,
+  OAuthDiscoveryStateSchema,
   UpstreamTokenResponse,
 } from "@repo/zod-types";
 import { sql } from "drizzle-orm";
@@ -18,6 +19,7 @@ import {
   unique,
   uuid,
 } from "drizzle-orm/pg-core";
+import { z } from "zod";
 
 // zod v4 types `ZodEnum.options` as a plain array, but drizzle's pgEnum requires
 // a non-empty tuple. Re-assert the shape while preserving the literal union so
@@ -77,6 +79,15 @@ export const mcpServersTable = pgTable(
       .$type<{ [key: string]: string }>()
       .notNull()
       .default(sql`'{}'::jsonb`),
+    // Per-server loopback-only redirect_uri override for upstream OAuth
+    // (RFC 8252). Some upstreams (e.g. Reclaim.ai) only accept
+    // http://127.0.0.1 / http://localhost redirect URIs at dynamic client
+    // registration; validated to that narrow shape at the zod schema
+    // boundary (see isValidLoopbackRedirectUri in @repo/zod-types), NOT
+    // here, so this column just stores whatever passed that check. NULL
+    // means "use MetaMCP's own APP_URL-derived callback" (today's
+    // behaviour).
+    redirect_uri: text("redirect_uri"),
     user_id: text("user_id").references(() => usersTable.id, {
       onDelete: "cascade",
     }),
@@ -105,6 +116,9 @@ export const oauthSessionsTable = pgTable(
     mcp_server_uuid: uuid("mcp_server_uuid")
       .notNull()
       .references(() => mcpServersTable.uuid, { onDelete: "cascade" }),
+    user_id: text("user_id")
+      .notNull()
+      .references(() => usersTable.id, { onDelete: "cascade" }),
     client_information: jsonb("client_information")
       .$type<OAuthClientInformation>()
       .notNull()
@@ -122,6 +136,10 @@ export const oauthSessionsTable = pgTable(
     // on success (one-shot). NEVER returned to the frontend — the
     // serializer strips it.
     expected_state: text("expected_state"),
+    discovery_state:
+      jsonb("discovery_state").$type<
+        z.infer<typeof OAuthDiscoveryStateSchema>
+      >(),
     created_at: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -131,7 +149,11 @@ export const oauthSessionsTable = pgTable(
   },
   (table) => [
     index("oauth_sessions_mcp_server_uuid_idx").on(table.mcp_server_uuid),
-    unique("oauth_sessions_unique_per_server_idx").on(table.mcp_server_uuid),
+    index("oauth_sessions_user_id_idx").on(table.user_id),
+    unique("oauth_sessions_unique_per_server_user_idx").on(
+      table.mcp_server_uuid,
+      table.user_id,
+    ),
   ],
 );
 

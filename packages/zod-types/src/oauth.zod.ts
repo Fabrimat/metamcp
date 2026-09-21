@@ -16,13 +16,23 @@ export const OAuthClientInformationSchema = z
   })
   .passthrough();
 
-// OAuth Tokens schema (matching MCP SDK)
+// OAuth Tokens schema (matching MCP SDK, plus MetaMCP's own `expires_at`
+// bookkeeping field below).
 export const OAuthTokensSchema = z.object({
   access_token: z.string(),
   token_type: z.string(),
   expires_in: z.number().optional(),
   scope: z.string().optional(),
   refresh_token: z.string().optional(),
+  // Absolute expiry (ms since epoch), computed from `expires_in` at the
+  // moment the token response was received — see `withExpiresAt` in
+  // apps/backend/src/lib/oauth-upstream/token-exchange.ts. NOT part of any
+  // RFC 6749 response; this is MetaMCP's own field so
+  // apps/backend/src/lib/metamcp/client.ts can decide to refresh
+  // proactively, before expiry, without depending on the upstream's HTTP
+  // status code (some upstreams give no reliable signal there at all).
+  // Absent when the upstream omitted `expires_in` — never guessed.
+  expires_at: z.number().optional(),
 });
 
 // Upstream token-response schema (RFC 6749 §5.1 plus common provider
@@ -40,10 +50,22 @@ export const UpstreamTokenResponseSchema = z
     refresh_token: z.string().optional(),
     scope: z.string().optional(),
     id_token: z.string().optional(),
+    // MetaMCP's own bookkeeping field, not an upstream response field —
+    // see the matching comment on `OAuthTokensSchema` above.
+    expires_at: z.number().optional(),
   })
   .passthrough();
 
 export type UpstreamTokenResponse = z.infer<typeof UpstreamTokenResponseSchema>;
+
+export const OAuthDiscoveryStateSchema = z.record(z.string(), z.unknown());
+
+export const OAuthSessionKeySchema = z.object({
+  mcp_server_uuid: z.string().uuid(),
+  user_id: z.string().min(1),
+});
+
+export type OAuthSessionKey = z.infer<typeof OAuthSessionKeySchema>;
 
 // OAuth Client schema for registered clients
 export const OAuthClientSchema = z.object({
@@ -154,6 +176,7 @@ export const GetOAuthSessionResponseSchema = z.union([
   }),
   z.object({
     success: z.literal(false),
+    error: z.string(),
     message: z.string(),
   }),
 ]);
@@ -230,6 +253,50 @@ export const ExchangeOAuthTokenResponseSchema = z.union([
   }),
 ]);
 
+// Server-side authorize-URL construction. Discovery, dynamic client
+// registration, PKCE, and `state` generation all run against Node's
+// `fetch` (not subject to CORS — see OAuthUpstreamClientProvider at
+// apps/backend/src/lib/oauth-upstream/provider.ts for why this moved off
+// the browser-side DbOAuthClientProvider). Returns the resulting
+// upstream /authorize URL for the frontend to navigate the browser to.
+// As with the other OAuth procedures in this file, the upstream URL is
+// NOT accepted from the caller — it is resolved server-side from the
+// mcp_servers row keyed by mcp_server_uuid.
+export const StartOAuthAuthorizationRequestSchema = z.object({
+  mcp_server_uuid: z.string().uuid(),
+});
+
+// Belt-and-braces alongside the server-side scheme guard in oauth.impl.ts's
+// startAuthorization: the frontend assigns `authorization_url` directly to
+// `window.location.href` (mcp-servers/[uuid]/page.tsx), and zod's built-in
+// `.url()` accepts `javascript:` (it's a syntactically valid URL, just not
+// a fetchable one) so it does not constrain the scheme at all. Parse with
+// `new URL(...)` and check `protocol` rather than regexing the string.
+const HttpAuthorizationUrlSchema = z.string().refine(
+  (value) => {
+    try {
+      const protocol = new URL(value).protocol;
+      return protocol === "http:" || protocol === "https:";
+    } catch {
+      return false;
+    }
+  },
+  { message: "authorization_url must be an http or https URL" },
+);
+
+export const StartOAuthAuthorizationResponseSchema = z.union([
+  z.object({
+    success: z.literal(true),
+    data: z.object({ authorization_url: HttpAuthorizationUrlSchema }),
+    message: z.string(),
+  }),
+  z.object({
+    success: z.literal(false),
+    error: z.string(),
+    error_description: z.string().optional(),
+  }),
+]);
+
 // Server-side refresh-token grant. Same CORS rationale: the upstream's
 // token endpoint typically rejects browser-origin requests. As with
 // `ExchangeOAuthTokenRequestSchema`, the upstream URL is NOT accepted
@@ -259,20 +326,20 @@ export const RefreshOAuthTokenResponseSchema = z.union([
 // returns (Salesforce `instance_url`, OIDC `id_token`, Microsoft
 // `ext_expires_in`, ...); the wider type lets the backend write the
 // response without `as unknown as OAuthTokens` casts.
-export const OAuthSessionCreateInputSchema = z.object({
-  mcp_server_uuid: z.string(),
+export const OAuthSessionCreateInputSchema = OAuthSessionKeySchema.extend({
   client_information: OAuthClientInformationSchema.optional(),
   tokens: UpstreamTokenResponseSchema.nullable().optional(),
   code_verifier: z.string().nullable().optional(),
   expected_state: z.string().optional(),
+  discovery_state: OAuthDiscoveryStateSchema.nullable().optional(),
 });
 
-export const OAuthSessionUpdateInputSchema = z.object({
-  mcp_server_uuid: z.string(),
+export const OAuthSessionUpdateInputSchema = OAuthSessionKeySchema.extend({
   client_information: OAuthClientInformationSchema.optional(),
   tokens: UpstreamTokenResponseSchema.nullable().optional(),
   code_verifier: z.string().nullable().optional(),
   expected_state: z.string().optional(),
+  discovery_state: OAuthDiscoveryStateSchema.nullable().optional(),
 });
 
 // Export repository types
@@ -287,6 +354,7 @@ export type OAuthSessionUpdateInput = z.infer<
 export const DatabaseOAuthSessionSchema = z.object({
   uuid: z.string(),
   mcp_server_uuid: z.string(),
+  user_id: z.string().min(1),
   client_information: OAuthClientInformationSchema.nullable(),
   tokens: UpstreamTokenResponseSchema.nullable(),
   code_verifier: z.string().nullable(),
@@ -294,6 +362,7 @@ export const DatabaseOAuthSessionSchema = z.object({
   // this column was added, and rows where the exchange already cleared
   // the value, both carry NULL. NEVER serialized to the frontend.
   expected_state: z.string().nullable(),
+  discovery_state: OAuthDiscoveryStateSchema.nullable(),
   created_at: z.date(),
   updated_at: z.date(),
 });

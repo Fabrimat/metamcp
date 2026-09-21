@@ -489,15 +489,21 @@ export const ADMIN_TOOLS: AdminToolDefinition[] = [
     "metamcp_get_oauth_session",
     "Get OAuth session tokens for an upstream OAuth-enabled MCP server.",
     GetOAuthSessionRequestSchema,
-    async (_userId, input) =>
-      oauthImplementations.get(GetOAuthSessionRequestSchema.parse(input)),
+    async (userId, input) =>
+      oauthImplementations.get(
+        GetOAuthSessionRequestSchema.parse(input),
+        userId,
+      ),
   ),
   defineTool(
     "metamcp_upsert_oauth_session",
     "Create or update OAuth session tokens for an upstream MCP server.",
     UpsertOAuthSessionRequestSchema,
-    async (_userId, input) =>
-      oauthImplementations.upsert(UpsertOAuthSessionRequestSchema.parse(input)),
+    async (userId, input) =>
+      oauthImplementations.upsert(
+        UpsertOAuthSessionRequestSchema.parse(input),
+        userId,
+      ),
   ),
 
   // Logs

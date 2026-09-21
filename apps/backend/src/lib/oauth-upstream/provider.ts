@@ -1,0 +1,283 @@
+// Server-side OAuthClientProvider used ONLY to build the upstream
+// authorize URL (RFC 6749 §4.1.1) via the MCP SDK's `auth()` orchestrator.
+//
+// WHY THIS EXISTS: MetaMCP authenticates to upstream MCP servers as an
+// OAuth client. Running discovery + dynamic client registration (DCR) +
+// authorize-URL construction in the browser (the original
+// DbOAuthClientProvider in apps/frontend/lib/oauth-provider.ts) is
+// unfixably broken for upstreams that don't set CORS headers on their
+// discovery/DCR endpoints — verified live against Reclaim.ai:
+// `/.well-known/oauth-authorization-server` returns 200 with no
+// Access-Control-Allow-Origin (the browser can't read the body), and
+// `OPTIONS` on its DCR endpoint returns 403. Node's `fetch` (used inside
+// the MCP SDK's `auth()` when called from here) is not subject to CORS.
+//
+// Token exchange and refresh already moved server-side for the same
+// reason — see oauth.impl.ts's exchangeToken/refreshToken and
+// token-exchange.ts. This provider finishes the migration for discovery +
+// DCR + the authorize redirect itself.
+//
+// Constructed fresh per `startAuthorization` tRPC call
+// (apps/backend/src/trpc/oauth.impl.ts). NOT used for token exchange or
+// refresh — those read/write oauth_sessions directly without going
+// through an OAuthClientProvider.
+import { randomBytes } from "node:crypto";
+
+import {
+  OAuthClientProvider,
+  OAuthDiscoveryState,
+} from "@modelcontextprotocol/sdk/client/auth.js";
+import {
+  OAuthClientInformation,
+  OAuthClientInformationMixed,
+  OAuthClientMetadata,
+  OAuthTokens,
+} from "@modelcontextprotocol/sdk/shared/auth.js";
+
+import { oauthSessionsRepository } from "../../db/repositories";
+import { resolveRedirectUri } from "../../trpc/pre-registered-oauth";
+import logger from "../../utils/logger";
+import { redactToken } from "./token-exchange";
+
+export interface OAuthUpstreamClientProviderOptions {
+  mcpServerUuid: string;
+  userId: string;
+  serverUrl: string;
+  // mcp_servers.redirect_uri — a per-server loopback override for
+  // upstreams that only accept http://127.0.0.1 / http://localhost
+  // redirect URIs (e.g. Reclaim.ai). Null means "use MetaMCP's own
+  // APP_URL-derived callback".
+  redirectUriOverride: string | null;
+}
+
+function clientInfoAsRecord(ci: unknown): Record<string, unknown> | null {
+  if (!ci || typeof ci !== "object") return null;
+  return ci as Record<string, unknown>;
+}
+
+export class OAuthUpstreamClientProvider implements OAuthClientProvider {
+  private readonly mcpServerUuid: string;
+  private readonly userId: string;
+  private readonly serverUrl: string;
+  private readonly redirectUriOverride: string | null;
+
+  // Populated by redirectToAuthorization() instead of navigating — see
+  // that method. The tRPC handler (oauth.impl.ts) reads this after
+  // `auth()` resolves with 'REDIRECT'.
+  authorizationUrl: URL | undefined;
+
+  constructor(options: OAuthUpstreamClientProviderOptions) {
+    this.mcpServerUuid = options.mcpServerUuid;
+    this.userId = options.userId;
+    this.serverUrl = options.serverUrl;
+    this.redirectUriOverride = options.redirectUriOverride;
+  }
+
+  private async loadSession() {
+    return oauthSessionsRepository.findByMcpServerAndUser(
+      this.mcpServerUuid,
+      this.userId,
+    );
+  }
+
+  get redirectUrl(): string {
+    return this.redirectUriOverride ?? resolveRedirectUri();
+  }
+
+  get clientMetadata(): OAuthClientMetadata {
+    // Mirrors the browser-side DbOAuthClientProvider
+    // (apps/frontend/lib/oauth-provider.ts) so a client registered via
+    // either path looks identical to the upstream.
+    return {
+      redirect_uris: [this.redirectUrl],
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      client_name: "MetaMCP",
+      client_uri: "https://github.com/metatool-ai/metamcp",
+    };
+  }
+
+  async clientInformation(): Promise<OAuthClientInformationMixed | undefined> {
+    const session = await this.loadSession();
+    const ci = clientInfoAsRecord(session?.client_information);
+    if (!ci || typeof ci.client_id !== "string") return undefined;
+    return ci as unknown as OAuthClientInformationMixed;
+  }
+
+  // CRITICAL: force redirect_uris[0] to the exact redirectUrl used for
+  // *this* flow before persisting, regardless of what the upstream's DCR
+  // response echoed back. Without this, an upstream that returns a
+  // different (or absent) redirect_uris would cause token-exchange's
+  // `client_information.redirect_uris[0] ?? resolveRedirectUri()`
+  // (oauth.impl.ts exchangeToken) to send a mismatched `redirect_uri` at
+  // the token endpoint. RFC 6749 §4.1.3 requires it to be byte-identical
+  // to the value used in the /authorize request, so a mismatch here is a
+  // guaranteed `invalid_grant` at exchange time.
+  async saveClientInformation(
+    clientInformation: OAuthClientInformationMixed,
+  ): Promise<void> {
+    const patched: Record<string, unknown> = {
+      ...clientInformation,
+      redirect_uris: [this.redirectUrl],
+    };
+    await oauthSessionsRepository.upsert({
+      mcp_server_uuid: this.mcpServerUuid,
+      user_id: this.userId,
+      client_information: patched as unknown as OAuthClientInformation,
+    });
+    logger.info(
+      `[oauth] DCR registered client — server=${this.mcpServerUuid} ` +
+        `client_id=${clientInformation.client_id} ` +
+        `client_secret=${redactToken(
+          (clientInformation as { client_secret?: string }).client_secret,
+        )}`,
+    );
+  }
+
+  // Deliberately always undefined: this provider exists only to build the
+  // authorize URL. Returning a real token here would let `auth()` treat
+  // the flow as already-authorized (or attempt a refresh) and skip the
+  // redirect branch entirely — see `authInternal` in the SDK's
+  // client/auth.js — AND it would bypass the refresh mutex in
+  // refresh-on-401.ts, a separate code path that owns token refresh.
+  // Token persistence after the callback happens in oauth.impl.ts's
+  // exchangeToken, not here.
+  async tokens(): Promise<OAuthTokens | undefined> {
+    return undefined;
+  }
+
+  // Never actually invoked: `tokens()` above always returns undefined and
+  // `redirectUrl` is always defined, so `auth()` always takes the
+  // redirect-authorization branch, never the direct-token-fetch or
+  // refresh branches that would call this. Throw loudly instead of
+  // silently no-op'ing so a future SDK behaviour change can't quietly
+  // drop tokens on the floor.
+  async saveTokens(): Promise<void> {
+    throw new Error(
+      "OAuthUpstreamClientProvider.saveTokens should never be invoked — " +
+        "token persistence happens in oauth.impl.ts's exchangeToken after " +
+        "the upstream redirects back with an authorization code.",
+    );
+  }
+
+  // Capture instead of navigate — this runs on the backend, so there is no
+  // browser to redirect. The tRPC handler reads `this.authorizationUrl`
+  // after `auth()` resolves with 'REDIRECT'.
+  redirectToAuthorization(authorizationUrl: URL): void {
+    this.authorizationUrl = authorizationUrl;
+  }
+
+  // RFC 6749 §10.12 CSRF defence — server-side twin of
+  // DbOAuthClientProvider.state() in apps/frontend/lib/oauth-provider.ts.
+  // Persisted so exchangeToken (oauth.impl.ts) can validate the round
+  // trip when the upstream redirects back.
+  async state(): Promise<string> {
+    const stateValue = randomBytes(16).toString("base64url");
+    await oauthSessionsRepository.upsert({
+      mcp_server_uuid: this.mcpServerUuid,
+      user_id: this.userId,
+      expected_state: stateValue,
+    });
+    return stateValue;
+  }
+
+  async saveCodeVerifier(codeVerifier: string): Promise<void> {
+    await oauthSessionsRepository.upsert({
+      mcp_server_uuid: this.mcpServerUuid,
+      user_id: this.userId,
+      code_verifier: codeVerifier,
+    });
+  }
+
+  async codeVerifier(): Promise<string> {
+    const session = await this.loadSession();
+    if (!session?.code_verifier) {
+      throw new Error("No code verifier saved for session");
+    }
+    return session.code_verifier;
+  }
+
+  // RFC 8707 Resource Indicator. MetaMCP's token-exchange POST
+  // (token-exchange.ts `exchangeAuthorizationCode`) does not send
+  // `resource`. Threading a selected resource through both legs would
+  // require persisting it across the authorize/exchange boundary (two
+  // separate tRPC calls with oauth_sessions as the only shared state), and
+  // no column exists for it — adding one is out of this brief's scope;
+  // oauth-sessions.repo.ts and its migrations are owned by an earlier
+  // brief. Recomputing it independently at exchange time would add a
+  // second live HTTP round-trip to the upstream's protected-resource
+  // endpoint on every token exchange for marginal benefit.
+  // ponytail: omit `resource` on BOTH legs (authorize AND token) rather
+  // than send it on only one — an authorize-sends-it/token-doesn't
+  // asymmetry is what audience-enforcing authorization servers actually
+  // reject. Upgrade path: add an oauth_sessions column for the selected
+  // resource and thread it into exchangeAuthorizationCode's params if a
+  // real upstream turns up that requires the parameter on both legs.
+  async validateResourceURL(): Promise<URL | undefined> {
+    return undefined;
+  }
+
+  // Bootstraps `auth()` from the pre-registered authorization_endpoint /
+  // token_endpoint fields (see pre-registered-oauth.ts /
+  // buildPreRegisteredClientInformation) instead of running RFC 9728 +
+  // RFC 8414 discovery. This is what makes the pre-registered
+  // authorization_endpoint field actually take effect on the authorize
+  // side: the SDK's startAuthorization() reads metadata.authorization_endpoint,
+  // never clientInformation.authorization_endpoint, so without this the
+  // field only ever affected the (already server-side) token-exchange path.
+  //
+  // Also synthesizes a minimal `resourceMetadata` (just the `resource`
+  // field) solely to short-circuit the SDK's fallback RFC 9728 fetch that
+  // runs when resourceMetadata is absent from cached discovery state (see
+  // `authInternal` in the SDK's client/auth.js) — its `resource` value is
+  // never read since validateResourceURL above always returns undefined.
+  //
+  // Returns undefined (falls through to normal discovery) unless BOTH
+  // endpoints are present, matching buildPreRegisteredClientInformation's
+  // "populate together" convention.
+  async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
+    const session = await this.loadSession();
+    if (session?.discovery_state) {
+      return session.discovery_state as unknown as OAuthDiscoveryState;
+    }
+    const ci = clientInfoAsRecord(session?.client_information);
+    const authorizationEndpoint =
+      typeof ci?.authorization_endpoint === "string"
+        ? ci.authorization_endpoint
+        : undefined;
+    const tokenEndpoint =
+      typeof ci?.token_endpoint === "string" ? ci.token_endpoint : undefined;
+    if (!authorizationEndpoint || !tokenEndpoint) {
+      return undefined;
+    }
+
+    let authorizationServerUrl: string;
+    try {
+      authorizationServerUrl = new URL(authorizationEndpoint).origin;
+    } catch {
+      // Malformed pre-registered URL — fall back to normal discovery
+      // rather than feeding startAuthorization() an unparsable base.
+      return undefined;
+    }
+
+    return {
+      authorizationServerUrl,
+      authorizationServerMetadata: {
+        issuer: authorizationServerUrl,
+        authorization_endpoint: authorizationEndpoint,
+        token_endpoint: tokenEndpoint,
+        response_types_supported: ["code"],
+      },
+      resourceMetadata: { resource: this.serverUrl },
+    };
+  }
+
+  async saveDiscoveryState(state: OAuthDiscoveryState): Promise<void> {
+    await oauthSessionsRepository.upsert({
+      mcp_server_uuid: this.mcpServerUuid,
+      user_id: this.userId,
+      discovery_state: state as unknown as Record<string, unknown>,
+    });
+  }
+}

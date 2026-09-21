@@ -3,19 +3,25 @@ import {
   OAuthSessionCreateInput,
   OAuthSessionUpdateInput,
 } from "@repo/zod-types";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 
 import { db } from "../index";
 import { oauthSessionsTable } from "../schema";
 
 export class OAuthSessionsRepository {
-  async findByMcpServerUuid(
+  async findByMcpServerAndUser(
     mcpServerUuid: string,
+    userId: string,
   ): Promise<DatabaseOAuthSession | undefined> {
     const [session] = await db
       .select()
       .from(oauthSessionsTable)
-      .where(eq(oauthSessionsTable.mcp_server_uuid, mcpServerUuid))
+      .where(
+        and(
+          eq(oauthSessionsTable.mcp_server_uuid, mcpServerUuid),
+          eq(oauthSessionsTable.user_id, userId),
+        ),
+      )
       .limit(1);
 
     return session;
@@ -26,6 +32,7 @@ export class OAuthSessionsRepository {
       .insert(oauthSessionsTable)
       .values({
         mcp_server_uuid: input.mcp_server_uuid,
+        user_id: input.user_id,
         ...(input.client_information && {
           client_information: input.client_information,
         }),
@@ -33,6 +40,9 @@ export class OAuthSessionsRepository {
         ...(input.code_verifier && { code_verifier: input.code_verifier }),
         ...(input.expected_state && {
           expected_state: input.expected_state,
+        }),
+        ...(input.discovery_state && {
+          discovery_state: input.discovery_state,
         }),
       })
       .returning();
@@ -54,9 +64,17 @@ export class OAuthSessionsRepository {
         ...(input.expected_state && {
           expected_state: input.expected_state,
         }),
+        ...(input.discovery_state && {
+          discovery_state: input.discovery_state,
+        }),
         updated_at: sql`NOW()`,
       })
-      .where(eq(oauthSessionsTable.mcp_server_uuid, input.mcp_server_uuid))
+      .where(
+        and(
+          eq(oauthSessionsTable.mcp_server_uuid, input.mcp_server_uuid),
+          eq(oauthSessionsTable.user_id, input.user_id),
+        ),
+      )
       .returning();
 
     return updatedSession;
@@ -69,6 +87,7 @@ export class OAuthSessionsRepository {
   // row, or undefined if no row exists for the server.
   async clearExpectedState(
     mcpServerUuid: string,
+    userId: string,
   ): Promise<DatabaseOAuthSession | undefined> {
     const [updatedSession] = await db
       .update(oauthSessionsTable)
@@ -76,7 +95,12 @@ export class OAuthSessionsRepository {
         expected_state: null,
         updated_at: sql`NOW()`,
       })
-      .where(eq(oauthSessionsTable.mcp_server_uuid, mcpServerUuid))
+      .where(
+        and(
+          eq(oauthSessionsTable.mcp_server_uuid, mcpServerUuid),
+          eq(oauthSessionsTable.user_id, userId),
+        ),
+      )
       .returning();
 
     return updatedSession;
@@ -93,20 +117,36 @@ export class OAuthSessionsRepository {
       .insert(oauthSessionsTable)
       .values({
         mcp_server_uuid: input.mcp_server_uuid,
+        user_id: input.user_id,
         ...(input.client_information && {
           client_information: input.client_information,
         }),
         ...(input.tokens && { tokens: input.tokens }),
         ...(input.code_verifier && { code_verifier: input.code_verifier }),
+        ...(input.expected_state && {
+          expected_state: input.expected_state,
+        }),
+        ...(input.discovery_state && {
+          discovery_state: input.discovery_state,
+        }),
       })
       .onConflictDoUpdate({
-        target: oauthSessionsTable.mcp_server_uuid,
+        target: [
+          oauthSessionsTable.mcp_server_uuid,
+          oauthSessionsTable.user_id,
+        ],
         set: {
           ...(input.client_information && {
             client_information: input.client_information,
           }),
           ...(input.tokens && { tokens: input.tokens }),
           ...(input.code_verifier && { code_verifier: input.code_verifier }),
+          ...(input.expected_state && {
+            expected_state: input.expected_state,
+          }),
+          ...(input.discovery_state && {
+            discovery_state: input.discovery_state,
+          }),
           updated_at: sql`NOW()`,
         },
       })
@@ -119,12 +159,18 @@ export class OAuthSessionsRepository {
     return row;
   }
 
-  async deleteByMcpServerUuid(
+  async deleteByMcpServerAndUser(
     mcpServerUuid: string,
+    userId: string,
   ): Promise<DatabaseOAuthSession | undefined> {
     const [deletedSession] = await db
       .delete(oauthSessionsTable)
-      .where(eq(oauthSessionsTable.mcp_server_uuid, mcpServerUuid))
+      .where(
+        and(
+          eq(oauthSessionsTable.mcp_server_uuid, mcpServerUuid),
+          eq(oauthSessionsTable.user_id, userId),
+        ),
+      )
       .returning();
 
     return deletedSession;

@@ -142,16 +142,17 @@ describe("resolveRedirectUri", () => {
 
 describe("persistPreRegisteredOAuthClient", () => {
   const SERVER_UUID = "00000000-0000-0000-0000-000000000001";
+  const USER_ID = "user-1";
   const mockRepo = {
-    findByMcpServerUuid: vi.fn(),
+    findByMcpServerAndUser: vi.fn(),
     create: vi.fn(),
     update: vi.fn(),
     upsert: vi.fn(),
-    deleteByMcpServerUuid: vi.fn(),
+    deleteByMcpServerAndUser: vi.fn(),
   } as unknown as OAuthSessionsRepository & {
-    findByMcpServerUuid: ReturnType<typeof vi.fn>;
+    findByMcpServerAndUser: ReturnType<typeof vi.fn>;
     upsert: ReturnType<typeof vi.fn>;
-    deleteByMcpServerUuid: ReturnType<typeof vi.fn>;
+    deleteByMcpServerAndUser: ReturnType<typeof vi.fn>;
   };
 
   beforeEach(() => {
@@ -162,6 +163,7 @@ describe("persistPreRegisteredOAuthClient", () => {
   it("upserts oauth_sessions.client_information with the server-derived redirect_uri", async () => {
     await persistPreRegisteredOAuthClient(
       SERVER_UUID,
+      USER_ID,
       {
         client_id: "3MVG9",
         client_secret: "shh",
@@ -176,6 +178,7 @@ describe("persistPreRegisteredOAuthClient", () => {
     expect(mockRepo.upsert).toHaveBeenCalledTimes(1);
     expect(mockRepo.upsert).toHaveBeenCalledWith({
       mcp_server_uuid: SERVER_UUID,
+      user_id: USER_ID,
       client_information: expect.objectContaining({
         client_id: "3MVG9",
         client_secret: "shh",
@@ -192,23 +195,27 @@ describe("persistPreRegisteredOAuthClient", () => {
 
   it("does not write to the repo when client_id is blank and no prior session exists", async () => {
     (
-      mockRepo.findByMcpServerUuid as ReturnType<typeof vi.fn>
+      mockRepo.findByMcpServerAndUser as ReturnType<typeof vi.fn>
     ).mockResolvedValue(undefined);
 
     await persistPreRegisteredOAuthClient(
       SERVER_UUID,
+      USER_ID,
       { client_id: "" },
       mockRepo,
     );
 
-    expect(mockRepo.findByMcpServerUuid).toHaveBeenCalledWith(SERVER_UUID);
+    expect(mockRepo.findByMcpServerAndUser).toHaveBeenCalledWith(
+      SERVER_UUID,
+      USER_ID,
+    );
     expect(mockRepo.upsert).not.toHaveBeenCalled();
-    expect(mockRepo.deleteByMcpServerUuid).not.toHaveBeenCalled();
+    expect(mockRepo.deleteByMcpServerAndUser).not.toHaveBeenCalled();
   });
 
   it("deletes the prior oauth_sessions row when the user clears the section", async () => {
     (
-      mockRepo.findByMcpServerUuid as ReturnType<typeof vi.fn>
+      mockRepo.findByMcpServerAndUser as ReturnType<typeof vi.fn>
     ).mockResolvedValue({
       uuid: "session-uuid",
       mcp_server_uuid: SERVER_UUID,
@@ -216,11 +223,208 @@ describe("persistPreRegisteredOAuthClient", () => {
 
     await persistPreRegisteredOAuthClient(
       SERVER_UUID,
+      USER_ID,
       { client_id: "" },
       mockRepo,
     );
 
-    expect(mockRepo.deleteByMcpServerUuid).toHaveBeenCalledWith(SERVER_UUID);
+    expect(mockRepo.deleteByMcpServerAndUser).toHaveBeenCalledWith(
+      SERVER_UUID,
+      USER_ID,
+    );
     expect(mockRepo.upsert).not.toHaveBeenCalled();
+  });
+
+  // Per-server redirect_uri override precedence (Brief A). Unlike the
+  // "never reflects the user's redirect_uri input" test above — which pins
+  // buildPreRegisteredClientInformation's own contract of using its
+  // redirectUri argument verbatim, with no user input in scope — this pins
+  // persistPreRegisteredOAuthClient's resolution of THAT argument: the
+  // per-server override wins when set, else the APP_URL derivation.
+  it("uses the per-server redirect_uri override when set", async () => {
+    await persistPreRegisteredOAuthClient(
+      SERVER_UUID,
+      USER_ID,
+      { client_id: "3MVG9", redirect_uri: "http://127.0.0.1:33418/callback" },
+      mockRepo,
+    );
+
+    expect(mockRepo.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        client_information: expect.objectContaining({
+          redirect_uris: ["http://127.0.0.1:33418/callback"],
+        }),
+      }),
+    );
+  });
+
+  it("falls back to the APP_URL derivation when no override is set", async () => {
+    await persistPreRegisteredOAuthClient(
+      SERVER_UUID,
+      USER_ID,
+      { client_id: "3MVG9" },
+      mockRepo,
+    );
+
+    expect(mockRepo.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        client_information: expect.objectContaining({
+          redirect_uris: ["https://metamcp.example.com/fe-oauth/callback"],
+        }),
+      }),
+    );
+  });
+
+  // Brief G: invalidate a persisted upstream OAuth registration when a
+  // server's redirect_uri override actually changes. The 4th argument is
+  // the override as stored on mcp_servers.redirect_uri BEFORE this call —
+  // mcp-servers.impl.ts's `update` passes the value it fetched prior to
+  // applying the update.
+  it("invalidates the persisted session when the override changes from one loopback value to another", async () => {
+    (
+      mockRepo.findByMcpServerAndUser as ReturnType<typeof vi.fn>
+    ).mockResolvedValue({ uuid: "session-uuid", mcp_server_uuid: SERVER_UUID });
+
+    await persistPreRegisteredOAuthClient(
+      SERVER_UUID,
+      USER_ID,
+      { client_id: "3MVG9", redirect_uri: "http://127.0.0.1:5000/callback" },
+      mockRepo,
+      "http://127.0.0.1:4000/callback",
+    );
+
+    expect(mockRepo.deleteByMcpServerAndUser).toHaveBeenCalledWith(
+      SERVER_UUID,
+      USER_ID,
+    );
+  });
+
+  it("invalidates the persisted session when an override is set where none existed", async () => {
+    (
+      mockRepo.findByMcpServerAndUser as ReturnType<typeof vi.fn>
+    ).mockResolvedValue({ uuid: "session-uuid", mcp_server_uuid: SERVER_UUID });
+
+    await persistPreRegisteredOAuthClient(
+      SERVER_UUID,
+      USER_ID,
+      { client_id: "3MVG9", redirect_uri: "http://127.0.0.1:5000/callback" },
+      mockRepo,
+      null,
+    );
+
+    expect(mockRepo.deleteByMcpServerAndUser).toHaveBeenCalledWith(
+      SERVER_UUID,
+      USER_ID,
+    );
+  });
+
+  it("invalidates the persisted session when an existing override is cleared", async () => {
+    (
+      mockRepo.findByMcpServerAndUser as ReturnType<typeof vi.fn>
+    ).mockResolvedValue({ uuid: "session-uuid", mcp_server_uuid: SERVER_UUID });
+
+    await persistPreRegisteredOAuthClient(
+      SERVER_UUID,
+      USER_ID,
+      { client_id: "3MVG9", redirect_uri: "" },
+      mockRepo,
+      "http://127.0.0.1:4000/callback",
+    );
+
+    expect(mockRepo.deleteByMcpServerAndUser).toHaveBeenCalledWith(
+      SERVER_UUID,
+      USER_ID,
+    );
+  });
+
+  it("does not invalidate when the same override value is resubmitted", async () => {
+    (
+      mockRepo.findByMcpServerAndUser as ReturnType<typeof vi.fn>
+    ).mockResolvedValue({ uuid: "session-uuid", mcp_server_uuid: SERVER_UUID });
+
+    await persistPreRegisteredOAuthClient(
+      SERVER_UUID,
+      USER_ID,
+      { client_id: "3MVG9", redirect_uri: "http://127.0.0.1:4000/callback" },
+      mockRepo,
+      "http://127.0.0.1:4000/callback",
+    );
+
+    expect(mockRepo.deleteByMcpServerAndUser).not.toHaveBeenCalled();
+  });
+
+  // Not one of the five named acceptance cases, but a direct consequence
+  // of how the fix is implemented: a brand-new client_id + redirect_uri
+  // pair entered for the very first time (no `previous` and no prior
+  // session) must survive — there is nothing stale to invalidate, and a
+  // naive "override changed" check with no existing-session guard would
+  // wipe out the row this same call just wrote.
+  it("does not invalidate a first-ever registration even though the override 'changed' from null", async () => {
+    (
+      mockRepo.findByMcpServerAndUser as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(undefined);
+
+    await persistPreRegisteredOAuthClient(
+      SERVER_UUID,
+      USER_ID,
+      { client_id: "3MVG9", redirect_uri: "http://127.0.0.1:4000/callback" },
+      mockRepo,
+      null,
+    );
+
+    expect(mockRepo.deleteByMcpServerAndUser).not.toHaveBeenCalled();
+    expect(mockRepo.upsert).toHaveBeenCalledTimes(1);
+  });
+
+  // Ordering regression pin. apps/frontend's edit form prefills
+  // oauth_client_info.client_id from whatever is already in
+  // client_information — including a client_id the SDK dynamically
+  // registered, not one the user typed in — so a redirect_uri-only edit
+  // still resubmits that (now-stale) client_id alongside the new
+  // redirect_uri. If invalidation ran BEFORE the upsert above instead of
+  // after, that upsert would immediately recreate a row pairing the stale
+  // client_id with the new redirect_uri, silently undoing the
+  // invalidation. A stateful fake is used (rather than mockRepo's bare
+  // vi.fn()s) so the assertion is on the actual END STATE — no row at all
+  // — not just that deleteByMcpServerAndUser was called at some point.
+  it("ends with no persisted session when a stale, form-prefilled client_id is resubmitted alongside a changed redirect_uri", async () => {
+    let stored: Record<string, unknown> | undefined = {
+      mcp_server_uuid: SERVER_UUID,
+      client_information: {
+        client_id: "dynamically-registered-id",
+        redirect_uris: ["http://127.0.0.1:4000/callback"],
+      },
+      tokens: { access_token: "old-token" },
+    };
+
+    const statefulRepo = {
+      findByMcpServerAndUser: vi.fn(async () => stored),
+      create: vi.fn(),
+      update: vi.fn(),
+      upsert: vi.fn(async (input: Record<string, unknown>) => {
+        stored = { ...stored, ...input };
+        return stored;
+      }),
+      deleteByMcpServerAndUser: vi.fn(async () => {
+        const deleted = stored;
+        stored = undefined;
+        return deleted;
+      }),
+    } as unknown as OAuthSessionsRepository;
+
+    await persistPreRegisteredOAuthClient(
+      SERVER_UUID,
+      USER_ID,
+      {
+        // Form-prefilled from the existing (dynamically registered)
+        // client_information, not user-typed — the realistic shape.
+        client_id: "dynamically-registered-id",
+        redirect_uri: "http://127.0.0.1:5000/callback",
+      },
+      statefulRepo,
+      "http://127.0.0.1:4000/callback",
+    );
+
+    expect(stored).toBeUndefined();
   });
 });
