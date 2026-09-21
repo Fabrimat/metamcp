@@ -24,12 +24,12 @@ import { ServerParameters } from "@repo/zod-types";
 
 import { oauthSessionsRepository } from "../../db/repositories";
 import logger from "../../utils/logger";
+import { OAuthUpstreamClientProvider } from "./provider";
 import {
-  discoverAuthorizationServerMetadata,
   OAuthTokens,
   redactToken,
   refreshAccessToken,
-  resolveTokenEndpoint,
+  resolveOAuthTokenContext,
   resolveTokenEndpointAuthMethod,
   UpstreamTokenError,
   withExpiresAt,
@@ -131,35 +131,32 @@ async function doRefresh(
       ? (clientInformation.client_secret as string)
       : undefined;
 
-  const discovered = await discoverAuthorizationServerMetadata(
-    serverParams.url,
-  );
-  const tokenEndpoint = resolveTokenEndpoint({
-    clientInformation,
-    discovered,
-    serverUrl: serverParams.url,
-  });
-  const authMethod = resolveTokenEndpointAuthMethod({
-    clientInformation,
-    discovered,
-    hasSecret: Boolean(clientSecret),
-  });
-
-  logger.info(
-    `[oauth] proxy 401 → refreshing tokens — server=${serverParams.uuid} ` +
-      `(${serverParams.name}) token_endpoint=${tokenEndpoint} ` +
-      `auth_method=${authMethod} ` +
-      `refresh_token=${redactToken(currentTokens.refresh_token)}`,
-  );
-
   let newTokens: OAuthTokens;
   try {
+    const { tokenEndpoint, discovered, resource } =
+      await resolveOAuthTokenContext({
+        clientInformation,
+        discoveryState: session.discovery_state,
+        serverUrl: serverParams.url,
+        provider: new OAuthUpstreamClientProvider({
+          mcpServerUuid: serverParams.uuid,
+          userId,
+          serverUrl: serverParams.url,
+          redirectUriOverride: null,
+        }),
+      });
+    const authMethod = resolveTokenEndpointAuthMethod({
+      clientInformation,
+      discovered,
+      hasSecret: Boolean(clientSecret),
+    });
     newTokens = await refreshAccessToken({
       tokenEndpoint,
       refreshToken: currentTokens.refresh_token,
       clientId,
       clientSecret,
       authMethod,
+      resource,
       scope:
         typeof currentTokens.scope === "string"
           ? currentTokens.scope

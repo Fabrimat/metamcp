@@ -1,4 +1,7 @@
-import type { OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js";
+import {
+  auth,
+  type OAuthDiscoveryState,
+} from "@modelcontextprotocol/sdk/client/auth.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../db/repositories", () => ({
@@ -59,17 +62,98 @@ describe("OAuthUpstreamClientProvider user-scoped persistence", () => {
     });
   });
 
+  it("persists a self-identifying state for the current server", async () => {
+    const { provider, upsert } = await load();
+    const state = await provider.state();
+    expect(state).toMatch(
+      new RegExp(`^upstream\\.${SERVER}\\.[A-Za-z0-9_-]{43}$`),
+    );
+    expect(upsert).toHaveBeenCalledWith({
+      mcp_server_uuid: SERVER,
+      user_id: USER,
+      expected_state: state,
+    });
+  });
+
+  it("prefers complete pre-registered endpoints over stale discovery", async () => {
+    const { provider, findByMcpServerAndUser } = await load();
+    findByMcpServerAndUser.mockResolvedValue({
+      client_information: {
+        client_id: "client",
+        authorization_endpoint: "https://configured.example/authorize",
+        token_endpoint: "https://configured.example/token",
+      },
+      discovery_state: { authorizationServerUrl: "https://stale.example" },
+    });
+    expect(await provider.discoveryState()).toMatchObject({
+      authorizationServerUrl: "https://configured.example",
+      authorizationServerMetadata: {
+        token_endpoint: "https://configured.example/token",
+      },
+      resourceMetadata: { resource: "https://mcp.example.com/mcp" },
+    });
+  });
+
+  it("persists pre-registered discovery when preparing an authorization redirect", async () => {
+    const { provider, findByMcpServerAndUser, upsert } = await load();
+    findByMcpServerAndUser.mockResolvedValue({
+      client_information: {
+        client_id: "client",
+        authorization_endpoint: "https://configured.example/authorize",
+        token_endpoint: "https://configured.example/token",
+      },
+    });
+    await auth(provider, { serverUrl: "https://mcp.example.com/mcp" });
+    expect(provider.authorizationUrl?.searchParams.get("resource")).toBe(
+      "https://mcp.example.com/mcp",
+    );
+    expect(upsert).toHaveBeenCalledWith({
+      mcp_server_uuid: SERVER,
+      user_id: USER,
+      discovery_state: expect.objectContaining({
+        authorizationServerUrl: "https://configured.example",
+        resourceMetadata: { resource: "https://mcp.example.com/mcp" },
+      }),
+    });
+  });
+
+  it("fails SDK authorization when cached protected resource metadata is incompatible", async () => {
+    const { provider, findByMcpServerAndUser } = await load();
+    findByMcpServerAndUser.mockResolvedValue({
+      client_information: { client_id: "client" },
+      discovery_state: {
+        authorizationServerUrl: "https://auth.example.com",
+        authorizationServerMetadata: {
+          issuer: "https://auth.example.com",
+          authorization_endpoint: "https://auth.example.com/authorize",
+          token_endpoint: "https://auth.example.com/token",
+          response_types_supported: ["code"],
+        },
+        resourceMetadata: { resource: "https://wrong.example.com/mcp" },
+      },
+    });
+    await expect(
+      auth(provider, { serverUrl: "https://mcp.example.com/mcp" }),
+    ).rejects.toThrow(/Protected resource/);
+  });
+
   it("persists and reloads serializable OAuth discovery state", async () => {
     const { provider, findByMcpServerAndUser, upsert } = await load();
     const discoveryState: OAuthDiscoveryState = {
       authorizationServerUrl: "https://auth.example.com",
+      resourceMetadataUrl:
+        "https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
       authorizationServerMetadata: {
         issuer: "https://auth.example.com",
         authorization_endpoint: "https://auth.example.com/authorize",
         token_endpoint: "https://auth.example.com/token",
         response_types_supported: ["code"],
       },
-      resourceMetadata: { resource: "https://mcp.example.com/mcp" },
+      resourceMetadata: {
+        resource: "https://mcp.example.com/mcp",
+        authorization_servers: ["https://auth.example.com"],
+        scopes_supported: ["tools:read"],
+      },
     };
 
     await provider.saveDiscoveryState(discoveryState);

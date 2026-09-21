@@ -1,3 +1,5 @@
+import { timingSafeEqual } from "node:crypto";
+
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import { OAuthError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { OAuthClientInformation } from "@modelcontextprotocol/sdk/shared/auth.js";
@@ -24,12 +26,12 @@ import {
 import { OAuthSessionsSerializer } from "../db/serializers";
 import { OAuthUpstreamClientProvider } from "../lib/oauth-upstream/provider";
 import { tryRefreshUpstreamTokens } from "../lib/oauth-upstream/refresh-on-401";
+import { parseUpstreamState } from "../lib/oauth-upstream/state";
 import {
-  discoverAuthorizationServerMetadata,
   exchangeAuthorizationCode,
   OAuthTokens,
   redactToken,
-  resolveTokenEndpoint,
+  resolveOAuthTokenContext,
   resolveTokenEndpointAuthMethod,
   UpstreamTokenError,
   withExpiresAt,
@@ -205,10 +207,8 @@ export const oauthImplementations = {
         }),
         ...(input.tokens && { tokens: input.tokens }),
         ...(input.code_verifier && { code_verifier: input.code_verifier }),
-        // CSRF-defence nonce (#299). MUST be forwarded — omitting it here
-        // silently disables state validation at `exchangeToken` because the
-        // DB column stays NULL and the validator takes the back-compat
-        // bypass. Pinned by the "forwards expected_state to the repo" test.
+        // Legacy session-upsert callers still need the nonce persisted.
+        // A missing nonce now makes exchangeToken fail closed.
         ...(input.expected_state && {
           expected_state: input.expected_state,
         }),
@@ -247,21 +247,26 @@ export const oauthImplementations = {
     input: z.infer<typeof ExchangeOAuthTokenRequestSchema>,
     userId: string,
   ): Promise<z.infer<typeof ExchangeOAuthTokenResponseSchema>> => {
+    const invalidState = {
+      success: false as const,
+      error: "invalid_state",
+      error_description:
+        "OAuth state mismatch or expired flow. Re-initiate authorization.",
+    };
+    const mcpServerUuid = parseUpstreamState(input.state);
+    if (!mcpServerUuid) return invalidState;
     // Resolve the upstream URL from the DB (NOT from the request). This is
     // the SSRF guard: an attacker-supplied URL would otherwise steer the
     // discovery + token POST at an attacker-controlled host, leaking the
     // authorization code, PKCE verifier, client_id, and client_secret.
-    const serverResolution = await resolveOwnedServerUrl(
-      input.mcp_server_uuid,
-      userId,
-    );
+    const serverResolution = await resolveOwnedServerUrl(mcpServerUuid, userId);
     if (!serverResolution.ok) {
       return { success: false as const, ...serverResolution.error };
     }
     const serverUrl = serverResolution.url;
 
     const session = await oauthSessionsRepository.findByMcpServerAndUser(
-      input.mcp_server_uuid,
+      mcpServerUuid,
       userId,
     );
     if (!session) {
@@ -272,6 +277,17 @@ export const oauthImplementations = {
           "No OAuth session found for this MCP server. The authorize flow may have been started against a different server.",
       };
     }
+    // The UUID only routes the lookup; authorize this callback using the full
+    // nonce belonging to the authenticated user's composite session.
+    const expectedState = Buffer.from(session.expected_state ?? "", "utf8");
+    const receivedState = Buffer.from(input.state, "utf8");
+    if (
+      !expectedState.length ||
+      expectedState.length !== receivedState.length ||
+      !timingSafeEqual(expectedState, receivedState)
+    )
+      return invalidState;
+
     if (!session.code_verifier) {
       return {
         success: false as const,
@@ -281,38 +297,6 @@ export const oauthImplementations = {
       };
     }
 
-    // RFC 6749 §10.12 CSRF defence. `expected_state` was persisted at the
-    // authorize-redirect step by `DbOAuthClientProvider.state()`. Three
-    // cases:
-    //
-    //   - expected_state IS NULL → flow started before this column existed,
-    //     OR a previous exchange already cleared it (replay). Accept for
-    //     backward compat with in-flight pre-fix flows; the column will be
-    //     populated on the NEXT authorize attempt and validated then.
-    //   - expected_state non-null AND matches input.state → proceed; clear
-    //     the column AFTER successful upstream exchange so the row can't
-    //     be replayed.
-    //   - expected_state non-null AND input.state missing OR mismatched →
-    //     fail-closed. Includes the missing case explicitly: an attacker
-    //     who omits state must not bypass the check by triggering a
-    //     truthy-undefined comparison.
-    //
-    // Validation runs BEFORE the upstream POST so a mismatch leaks no
-    // authorization code to a third party.
-    if (session.expected_state) {
-      if (!input.state || input.state !== session.expected_state) {
-        logger.warn(
-          `[oauth] state mismatch — server=${input.mcp_server_uuid} ` +
-            `expected_present=true got_present=${Boolean(input.state)}`,
-        );
-        return {
-          success: false as const,
-          error: "invalid_state",
-          error_description:
-            "OAuth state mismatch — possible CSRF. The authorize flow must be re-initiated.",
-        };
-      }
-    }
     const clientInformation = clientInfoAsRecord(session.client_information);
     const clientId =
       clientInformation && typeof clientInformation.client_id === "string"
@@ -332,18 +316,6 @@ export const oauthImplementations = {
         ? (clientInformation.client_secret as string)
         : undefined;
 
-    const discovered = await discoverAuthorizationServerMetadata(serverUrl);
-    const tokenEndpoint = resolveTokenEndpoint({
-      clientInformation,
-      discovered,
-      serverUrl,
-    });
-    const authMethod = resolveTokenEndpointAuthMethod({
-      clientInformation,
-      discovered,
-      hasSecret: Boolean(clientSecret),
-    });
-
     // Use the redirect_uri that was actually registered/authorized rather
     // than recomputing it — this is the byte-identical guarantee RFC 6749
     // §4.1.3 requires between the /authorize and token-exchange requests,
@@ -359,14 +331,25 @@ export const oauthImplementations = {
         ? registeredRedirectUris[0]
         : resolveRedirectUri();
 
-    logger.info(
-      `[oauth] exchanging code for tokens — server=${input.mcp_server_uuid} ` +
-        `token_endpoint=${tokenEndpoint} auth_method=${authMethod} ` +
-        `code=${redactToken(input.code)}`,
-    );
-
     let tokens: OAuthTokens;
     try {
+      const { tokenEndpoint, discovered, resource } =
+        await resolveOAuthTokenContext({
+          clientInformation,
+          discoveryState: session.discovery_state,
+          serverUrl,
+          provider: new OAuthUpstreamClientProvider({
+            mcpServerUuid,
+            userId,
+            serverUrl,
+            redirectUriOverride: null,
+          }),
+        });
+      const authMethod = resolveTokenEndpointAuthMethod({
+        clientInformation,
+        discovered,
+        hasSecret: Boolean(clientSecret),
+      });
       tokens = await exchangeAuthorizationCode({
         tokenEndpoint,
         code: input.code,
@@ -375,11 +358,29 @@ export const oauthImplementations = {
         clientId,
         clientSecret,
         authMethod,
+        resource,
       });
     } catch (error) {
       if (error instanceof UpstreamTokenError) {
+        // Terminal authorization errors require a new authorize flow. Preserve
+        // the nonce for rate limiting, server failures and transient errors.
+        if (
+          error.status >= 400 &&
+          error.status < 500 &&
+          error.status !== 408 &&
+          error.status !== 429 &&
+          error.oauthError &&
+          !["temporarily_unavailable", "server_error"].includes(
+            error.oauthError.error,
+          )
+        ) {
+          await oauthSessionsRepository.clearExpectedState(
+            mcpServerUuid,
+            userId,
+          );
+        }
         logger.warn(
-          `[oauth] upstream token exchange failed — server=${input.mcp_server_uuid} ` +
+          `[oauth] upstream token exchange failed — server=${mcpServerUuid} ` +
             `status=${error.status} error=${error.oauthError?.error ?? "unknown"}`,
         );
         return upstreamErrorResponse(error);
@@ -388,7 +389,7 @@ export const oauthImplementations = {
       // Surface it via logger.error and re-throw so tRPC returns a 500 to
       // the caller instead of masking it as `internal_error`.
       logger.error(
-        `[oauth] exchangeToken unexpected error for server ${input.mcp_server_uuid}:`,
+        `[oauth] exchangeToken unexpected error for server ${mcpServerUuid}:`,
         error,
       );
       throw error;
@@ -400,45 +401,23 @@ export const oauthImplementations = {
     tokens = withExpiresAt(tokens);
 
     await oauthSessionsRepository.upsert({
-      mcp_server_uuid: input.mcp_server_uuid,
+      mcp_server_uuid: mcpServerUuid,
       user_id: userId,
       tokens,
     });
 
-    // One-shot clear: with the upstream exchange successful, the
-    // `expected_state` nonce has served its purpose. Clearing it now
-    // ensures a replay of the same `code`+`state` pair would fall through
-    // the back-compat NULL branch on a second exchange attempt — but since
-    // the `code` itself is already burned by the upstream, the replay
-    // would fail with `invalid_grant` anyway. Belt-and-braces.
-    //
-    // Only runs on SUCCESS — an upstream error returns above without
-    // clearing, so the user can retry the exchange without re-running the
-    // authorize flow.
-    try {
-      await oauthSessionsRepository.clearExpectedState(
-        input.mcp_server_uuid,
-        userId,
-      );
-    } catch (clearError) {
-      // Logging only — the exchange itself already succeeded and a stale
-      // expected_state will be overwritten on the next authorize attempt.
-      logger.warn(
-        `[oauth] failed to clear expected_state after successful exchange ` +
-          `— server=${input.mcp_server_uuid}: ${
-            clearError instanceof Error ? clearError.message : "unknown"
-          }`,
-      );
-    }
+    // Fail closed: do not report success if consuming the nonce failed.
+    await oauthSessionsRepository.clearExpectedState(mcpServerUuid, userId);
 
     logger.info(
-      `[oauth] token exchange succeeded — server=${input.mcp_server_uuid} ` +
+      `[oauth] token exchange succeeded — server=${mcpServerUuid} ` +
         `access_token=${redactToken(tokens.access_token)} ` +
         `refresh_token=${redactToken(tokens.refresh_token)}`,
     );
 
     return {
       success: true as const,
+      data: { mcp_server_uuid: mcpServerUuid },
       message: "OAuth tokens persisted",
     };
   },

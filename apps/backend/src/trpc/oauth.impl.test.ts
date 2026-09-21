@@ -25,6 +25,283 @@ vi.mock("../utils/logger", () => ({
 }));
 
 const ORIGINAL_APP_URL = process.env.APP_URL;
+const stateFor = (uuid: string) => `upstream.${uuid}.${"a".repeat(43)}`;
+
+describe("persisted OAuth protocol context", () => {
+  const serverUuid = "00000000-0000-4000-8000-000000000003";
+  const state = `upstream.${serverUuid}.${"a".repeat(43)}`;
+  const discovery = {
+    authorizationServerUrl: "https://identity.example/tenant",
+    authorizationServerMetadata: {
+      issuer: "https://identity.example/tenant",
+      authorization_endpoint: "https://identity.example/authorize",
+      token_endpoint: "https://tokens.example/exchange",
+      response_types_supported: ["code"],
+    },
+    resourceMetadata: {
+      resource: "https://resource.example/mcp",
+      authorization_servers: ["https://identity.example/tenant"],
+    },
+  };
+  const setup = async () => {
+    const { oauthSessionsRepository, mcpServersRepository } =
+      await import("../db/repositories");
+    const { oauthImplementations } = await import("./oauth.impl");
+    const session = {
+      expected_state: state as string | null,
+      code_verifier: "verifier",
+      client_information: {
+        client_id: "client",
+        redirect_uris: ["https://metamcp.example/fe-oauth/callback"],
+      } as Record<string, unknown>,
+      discovery_state: structuredClone(discovery) as Record<string, unknown>,
+      tokens: {
+        access_token: "OLD",
+        token_type: "Bearer",
+        refresh_token: "RT",
+      },
+    };
+    vi.mocked(mcpServersRepository.findByUuid).mockResolvedValue({
+      uuid: serverUuid,
+      user_id: null,
+      type: "STREAMABLE_HTTP",
+      url: "https://resource.example/mcp",
+    } as never);
+    vi.mocked(
+      oauthSessionsRepository.findByMcpServerAndUser,
+    ).mockImplementation(async (_server, user) =>
+      user === "user-a" ? (session as never) : undefined,
+    );
+    vi.mocked(oauthSessionsRepository.clearExpectedState).mockImplementation(
+      async () => {
+        session.expected_state = null;
+        return undefined as never;
+      },
+    );
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(
+        async () =>
+          new Response(
+            JSON.stringify({ access_token: "NEW", token_type: "Bearer" }),
+            { status: 200 },
+          ),
+      );
+    return { oauthImplementations, oauthSessionsRepository, session, fetchSpy };
+  };
+  beforeEach(() => vi.resetAllMocks());
+  afterEach(() => vi.restoreAllMocks());
+
+  it("posts exchange and refresh only to the persisted authorization server with the same resource", async () => {
+    const { oauthImplementations, fetchSpy } = await setup();
+    expect(
+      await oauthImplementations.exchangeToken({ code: "C", state }, "user-a"),
+    ).toMatchObject({ success: true, data: { mcp_server_uuid: serverUuid } });
+    expect(
+      await oauthImplementations.refreshToken(
+        { mcp_server_uuid: serverUuid },
+        "user-a",
+      ),
+    ).toMatchObject({ success: true });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    for (const [url, init] of fetchSpy.mock.calls) {
+      expect(url).toBe("https://tokens.example/exchange");
+      expect(init?.method).toBe("POST");
+      expect((init?.body as URLSearchParams).get("resource")).toBe(
+        "https://resource.example/mcp",
+      );
+    }
+  });
+
+  it("carries freshly discovered authorization server and resource through authorize, exchange and refresh", async () => {
+    const { oauthImplementations, oauthSessionsRepository, session, fetchSpy } =
+      await setup();
+    session.discovery_state = null as never;
+    vi.mocked(oauthSessionsRepository.upsert).mockImplementation(
+      async (input) => {
+        Object.assign(session, input);
+        return session as never;
+      },
+    );
+    fetchSpy.mockImplementation(async (url) => {
+      if (String(url).includes("/.well-known/oauth-protected-resource"))
+        return jsonResponse(200, discovery.resourceMetadata);
+      if (String(url).includes("/.well-known/oauth-authorization-server"))
+        return jsonResponse(200, discovery.authorizationServerMetadata);
+      if (String(url) === "https://tokens.example/exchange")
+        return jsonResponse(200, {
+          access_token: "NEW",
+          token_type: "Bearer",
+          refresh_token: "RT",
+        });
+      throw new Error(`Unexpected OAuth request: ${String(url)}`);
+    });
+    process.env.APP_URL = "https://metamcp.example";
+    try {
+      const started = await oauthImplementations.startAuthorization(
+        { mcp_server_uuid: serverUuid },
+        "user-a",
+      );
+      expect(started.success).toBe(true);
+      if (!started.success) throw new Error("Authorization did not start");
+      const authorizationUrl = new URL(started.data.authorization_url);
+      expect(authorizationUrl.origin).toBe("https://identity.example");
+      expect(authorizationUrl.searchParams.get("resource")).toBe(
+        "https://resource.example/mcp",
+      );
+      expect(session.discovery_state).toMatchObject(discovery);
+      fetchSpy.mockClear();
+      const callbackState = authorizationUrl.searchParams.get("state");
+      if (!callbackState) throw new Error("Authorization state missing");
+      expect(
+        await oauthImplementations.exchangeToken(
+          { code: "C", state: callbackState },
+          "user-a",
+        ),
+      ).toMatchObject({ success: true });
+      expect(
+        await oauthImplementations.refreshToken(
+          { mcp_server_uuid: serverUuid },
+          "user-a",
+        ),
+      ).toMatchObject({ success: true });
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      for (const [url, init] of fetchSpy.mock.calls) {
+        expect(url).toBe("https://tokens.example/exchange");
+        expect((init?.body as URLSearchParams).get("resource")).toBe(
+          "https://resource.example/mcp",
+        );
+      }
+    } finally {
+      if (ORIGINAL_APP_URL === undefined) delete process.env.APP_URL;
+      else process.env.APP_URL = ORIGINAL_APP_URL;
+    }
+  });
+
+  it("uses the persisted authorization server for the /token fallback", async () => {
+    const { oauthImplementations, session, fetchSpy } = await setup();
+    delete session.discovery_state.authorizationServerMetadata;
+    expect(
+      await oauthImplementations.exchangeToken({ code: "C", state }, "user-a"),
+    ).toMatchObject({ success: true });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy.mock.calls[0]?.[0]).toBe("https://identity.example/token");
+  });
+
+  it("honors a pre-registered token endpoint over persisted metadata", async () => {
+    const { oauthImplementations, session, fetchSpy } = await setup();
+    session.client_information.token_endpoint =
+      "https://configured.example/token";
+    expect(
+      await oauthImplementations.exchangeToken({ code: "C", state }, "user-a"),
+    ).toMatchObject({ success: true });
+    expect(fetchSpy.mock.calls[0]?.[0]).toBe(
+      "https://configured.example/token",
+    );
+  });
+
+  it.each([
+    null,
+    `upstream.${serverUuid}.${"b".repeat(43)}`,
+    "short",
+    "é".repeat(state.length),
+  ])(
+    "fails closed for a missing or mismatched stored state: %s",
+    async (expected) => {
+      const { oauthImplementations, session, fetchSpy } = await setup();
+      session.expected_state = expected;
+      expect(
+        await oauthImplementations.exchangeToken(
+          { code: "C", state },
+          "user-a",
+        ),
+      ).toMatchObject({ success: false, error: "invalid_state" });
+      expect(fetchSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not use another user's state on a public server", async () => {
+    const { oauthImplementations, oauthSessionsRepository, fetchSpy } =
+      await setup();
+    expect(
+      await oauthImplementations.exchangeToken({ code: "C", state }, "user-b"),
+    ).toMatchObject({ success: false });
+    expect(oauthSessionsRepository.findByMcpServerAndUser).toHaveBeenCalledWith(
+      serverUuid,
+      "user-b",
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects replay after a successful exchange without another fetch", async () => {
+    const { oauthImplementations, fetchSpy } = await setup();
+    await oauthImplementations.exchangeToken({ code: "C", state }, "user-a");
+    fetchSpy.mockClear();
+    expect(
+      await oauthImplementations.exchangeToken({ code: "C", state }, "user-a"),
+    ).toMatchObject({ success: false, error: "invalid_state" });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [400, "invalid_grant", null],
+    [400, "invalid_client", null],
+    [503, "temporarily_unavailable", state],
+    [429, "slow_down", state],
+    [408, "request_timeout", state],
+  ])(
+    "handles terminal versus retryable upstream failure %s %s",
+    async (status, error, remaining) => {
+      const { oauthImplementations, session, fetchSpy } = await setup();
+      fetchSpy.mockResolvedValue(
+        new Response(JSON.stringify({ error }), { status }),
+      );
+      expect(
+        await oauthImplementations.exchangeToken(
+          { code: "C", state },
+          "user-a",
+        ),
+      ).toMatchObject({ success: false, error });
+      expect(session.expected_state).toBe(remaining);
+    },
+  );
+
+  it.each([
+    {},
+    { authorizationServerUrl: "file:///tmp/token" },
+    {
+      ...discovery,
+      authorizationServerMetadata: {
+        ...discovery.authorizationServerMetadata,
+        token_endpoint: "javascript:alert(1)",
+      },
+    },
+    {
+      ...discovery,
+      resourceMetadata: { resource: "https://wrong.example/mcp" },
+    },
+    { ...discovery, resourceMetadata: { resource: 42 } },
+  ])(
+    "rejects corrupt discovery before outbound exchange or refresh: %j",
+    async (corrupt) => {
+      const { oauthImplementations, session, fetchSpy } = await setup();
+      session.discovery_state = corrupt;
+      expect(
+        await oauthImplementations.exchangeToken(
+          { code: "C", state },
+          "user-a",
+        ),
+      ).toMatchObject({ success: false, error: "invalid_discovery_state" });
+      expect(
+        await oauthImplementations.refreshToken(
+          { mcp_server_uuid: serverUuid },
+          "user-a",
+        ),
+      ).toMatchObject({ success: false, error: "invalid_discovery_state" });
+      expect(fetchSpy).not.toHaveBeenCalled();
+    },
+  );
+});
 
 const jsonResponse = (status: number, body: unknown): Response =>
   new Response(JSON.stringify(body), {
@@ -250,6 +527,7 @@ describe("oauthImplementations.exchangeToken", () => {
       ownedServer(SERVER_UUID, "https://api.salesforce.com/platform/mcp/v1"),
     );
     findByMcpServerAndUser.mockResolvedValue({
+      expected_state: stateFor(SERVER_UUID),
       uuid: "sess",
       mcp_server_uuid: SERVER_UUID,
       code_verifier: "PKCE_VERIFIER",
@@ -288,7 +566,7 @@ describe("oauthImplementations.exchangeToken", () => {
       });
 
     const result = await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "CODE_FROM_REDIRECT" },
+      { state: stateFor(SERVER_UUID), code: "CODE_FROM_REDIRECT" },
       USER_ID,
     );
 
@@ -319,6 +597,7 @@ describe("oauthImplementations.exchangeToken", () => {
       ownedServer(SERVER_UUID, "https://api.reclaim.ai/mcp"),
     );
     findByMcpServerAndUser.mockResolvedValue({
+      expected_state: stateFor(SERVER_UUID),
       uuid: "sess",
       mcp_server_uuid: SERVER_UUID,
       code_verifier: "PKCE_VERIFIER",
@@ -347,7 +626,7 @@ describe("oauthImplementations.exchangeToken", () => {
       });
 
     const result = await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "CODE" },
+      { state: stateFor(SERVER_UUID), code: "CODE" },
       USER_ID,
     );
 
@@ -373,6 +652,7 @@ describe("oauthImplementations.exchangeToken", () => {
       ownedServer(SERVER_UUID, "https://api.example.com/mcp"),
     );
     findByMcpServerAndUser.mockResolvedValue({
+      expected_state: stateFor(SERVER_UUID),
       uuid: "sess",
       mcp_server_uuid: SERVER_UUID,
       code_verifier: "PKCE_VERIFIER",
@@ -395,7 +675,7 @@ describe("oauthImplementations.exchangeToken", () => {
       });
 
     const result = await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "CODE" },
+      { state: stateFor(SERVER_UUID), code: "CODE" },
       USER_ID,
     );
 
@@ -419,6 +699,7 @@ describe("oauthImplementations.exchangeToken", () => {
       ownedServer(SERVER_UUID, "https://api.salesforce.com/mcp"),
     );
     findByMcpServerAndUser.mockResolvedValue({
+      expected_state: stateFor(SERVER_UUID),
       mcp_server_uuid: SERVER_UUID,
       code_verifier: "PKCE_VERIFIER",
       client_information: {
@@ -442,7 +723,7 @@ describe("oauthImplementations.exchangeToken", () => {
       });
 
     const result = await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "BAD" },
+      { state: stateFor(SERVER_UUID), code: "BAD" },
       USER_ID,
     );
 
@@ -460,7 +741,7 @@ describe("oauthImplementations.exchangeToken", () => {
     const { oauthImplementations, findServerByUuid } = await loadModule();
     findServerByUuid.mockResolvedValue(undefined);
     const result = await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "C" },
+      { state: stateFor(SERVER_UUID), code: "C" },
       USER_ID,
     );
     expect(result.success).toBe(false);
@@ -473,7 +754,7 @@ describe("oauthImplementations.exchangeToken", () => {
       ownedServer(SERVER_UUID, "https://api.example.com/mcp", "other-user"),
     );
     const result = await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "C" },
+      { state: stateFor(SERVER_UUID), code: "C" },
       USER_ID,
     );
     expect(result.success).toBe(false);
@@ -489,7 +770,7 @@ describe("oauthImplementations.exchangeToken", () => {
     findByMcpServerAndUser.mockResolvedValue(undefined);
 
     const result = await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "C" },
+      { state: stateFor(SERVER_UUID), code: "C" },
       USER_ID,
     );
     expect(result.success).toBe(false);
@@ -503,6 +784,7 @@ describe("oauthImplementations.exchangeToken", () => {
       ownedServer(SERVER_UUID, "https://api.example.com/mcp"),
     );
     findByMcpServerAndUser.mockResolvedValue({
+      expected_state: stateFor(SERVER_UUID),
       mcp_server_uuid: SERVER_UUID,
       code_verifier: null,
       client_information: { client_id: "x" },
@@ -510,7 +792,7 @@ describe("oauthImplementations.exchangeToken", () => {
     });
 
     const result = await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "C" },
+      { state: stateFor(SERVER_UUID), code: "C" },
       USER_ID,
     );
     expect(result.success).toBe(false);
@@ -524,6 +806,7 @@ describe("oauthImplementations.exchangeToken", () => {
       ownedServer(SERVER_UUID, "https://api.example.com/mcp"),
     );
     findByMcpServerAndUser.mockResolvedValue({
+      expected_state: stateFor(SERVER_UUID),
       mcp_server_uuid: SERVER_UUID,
       code_verifier: "verifier",
       client_information: {},
@@ -531,7 +814,7 @@ describe("oauthImplementations.exchangeToken", () => {
     });
 
     const result = await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "C" },
+      { state: stateFor(SERVER_UUID), code: "C" },
       USER_ID,
     );
     expect(result.success).toBe(false);
@@ -616,6 +899,7 @@ describe("exchangeToken redirect_uri byte-match", () => {
       ),
     );
     findByMcpServerAndUser.mockResolvedValue({
+      expected_state: stateFor("00000000-0000-0000-0000-000000000fff"),
       mcp_server_uuid: "00000000-0000-0000-0000-000000000fff",
       code_verifier: "v",
       client_information: {
@@ -643,10 +927,7 @@ describe("exchangeToken redirect_uri byte-match", () => {
       });
 
     await oauthImplementations.exchangeToken(
-      {
-        mcp_server_uuid: "00000000-0000-0000-0000-000000000fff",
-        code: "C",
-      },
+      { state: stateFor("00000000-0000-0000-0000-000000000fff"), code: "C" },
       USER_ID,
     );
 
@@ -715,6 +996,7 @@ describe("exchangeToken redirect_uri source", () => {
       ownedServer(SERVER_UUID, "https://upstream.example.com/mcp"),
     );
     findByMcpServerAndUser.mockResolvedValue({
+      expected_state: stateFor(SERVER_UUID),
       mcp_server_uuid: SERVER_UUID,
       code_verifier: "v",
       client_information: {
@@ -740,7 +1022,7 @@ describe("exchangeToken redirect_uri source", () => {
       });
 
     await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "C" },
+      { state: stateFor(SERVER_UUID), code: "C" },
       USER_ID,
     );
 
@@ -759,6 +1041,7 @@ describe("exchangeToken redirect_uri source", () => {
       ownedServer(SERVER_UUID, "https://upstream.example.com/mcp"),
     );
     findByMcpServerAndUser.mockResolvedValue({
+      expected_state: stateFor(SERVER_UUID),
       mcp_server_uuid: SERVER_UUID,
       code_verifier: "v",
       client_information: {
@@ -783,7 +1066,7 @@ describe("exchangeToken redirect_uri source", () => {
       });
 
     await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "C" },
+      { state: stateFor(SERVER_UUID), code: "C" },
       USER_ID,
     );
 
@@ -852,6 +1135,7 @@ describe("oauthImplementations.refreshToken", () => {
       ownedServer(SERVER_UUID, "https://example.com/mcp"),
     );
     findByMcpServerAndUser.mockResolvedValue({
+      expected_state: stateFor(SERVER_UUID),
       mcp_server_uuid: SERVER_UUID,
       code_verifier: null,
       client_information: {
@@ -906,6 +1190,7 @@ describe("oauthImplementations.refreshToken", () => {
       ownedServer(SERVER_UUID, "https://example.com/mcp"),
     );
     findByMcpServerAndUser.mockResolvedValue({
+      expected_state: stateFor(SERVER_UUID),
       mcp_server_uuid: SERVER_UUID,
       client_information: { client_id: "x" },
       tokens: { access_token: "x", token_type: "Bearer" },
@@ -920,17 +1205,8 @@ describe("oauthImplementations.refreshToken", () => {
   });
 });
 
-// RFC 6749 §10.12 state CSRF defence. The schema accepted `state` and the
-// callback forwarded it, but PR #295 never compared it to a persisted
-// value. These tests pin the validation behaviour added in #299:
-//   - expected_state truthy → must match input.state (and missing input.state
-//     is treated as a mismatch, NOT a bypass)
-//   - expected_state null/undefined → back-compat for in-flight pre-fix
-//     flows; the exchange proceeds without state validation
-//   - one-shot: on a successful exchange, expected_state is cleared so a
-//     replay cannot reuse the same code+state pair
-//   - on upstream error, expected_state is preserved so the user can retry
-//     the exchange without re-running authorize
+// RFC 6749 §10.12: exact state verification is mandatory. Consumed or missing
+// state fails closed, and terminal authorization errors require a fresh flow.
 describe("exchangeToken state CSRF validation", () => {
   beforeEach(() => {
     process.env.APP_URL = "https://metamcp.example.com";
@@ -991,7 +1267,7 @@ describe("exchangeToken state CSRF validation", () => {
     );
   });
 
-  it("expected_state null in DB → exchange proceeds (back-compat for in-flight pre-fix flows)", async () => {
+  it("expected_state null in DB fails closed before fetching", async () => {
     const {
       oauthImplementations,
       findByMcpServerAndUser,
@@ -1021,15 +1297,14 @@ describe("exchangeToken state CSRF validation", () => {
       .mockImplementation(upstreamSuccess as unknown as typeof fetch);
 
     const result = await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "C", state: "from-upstream" },
+      { code: "C", state: stateFor(SERVER_UUID) },
       USER_ID,
     );
 
-    expect(result.success).toBe(true);
-    expect(upsert).toHaveBeenCalledTimes(1);
-    // Clear still runs to belt-and-braces against a future authorize seeding
-    // expected_state on this row.
-    expect(clearExpectedState).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ success: false, error: "invalid_state" });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(upsert).not.toHaveBeenCalled();
+    expect(clearExpectedState).not.toHaveBeenCalled();
     fetchSpy.mockRestore();
   });
 
@@ -1052,7 +1327,7 @@ describe("exchangeToken state CSRF validation", () => {
         token_endpoint: "https://upstream.example.com/token",
       },
       tokens: null,
-      expected_state: "the-nonce",
+      expected_state: stateFor(SERVER_UUID),
     });
     upsert.mockResolvedValue({});
     clearExpectedState.mockResolvedValue({});
@@ -1062,7 +1337,7 @@ describe("exchangeToken state CSRF validation", () => {
       .mockImplementation(upstreamSuccess as unknown as typeof fetch);
 
     const result = await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "C", state: "the-nonce" },
+      { code: "C", state: stateFor(SERVER_UUID) },
       USER_ID,
     );
 
@@ -1088,13 +1363,13 @@ describe("exchangeToken state CSRF validation", () => {
       code_verifier: "v",
       client_information: { client_id: "c" },
       tokens: null,
-      expected_state: "the-nonce",
+      expected_state: stateFor(SERVER_UUID),
     });
 
     const fetchSpy = vi.spyOn(globalThis, "fetch");
 
     const result = await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "C", state: "different-value" },
+      { code: "C", state: "different-value" },
       USER_ID,
     );
 
@@ -1108,7 +1383,7 @@ describe("exchangeToken state CSRF validation", () => {
     fetchSpy.mockRestore();
   });
 
-  it("expected_state present but input.state missing → returns invalid_state (does not bypass)", async () => {
+  it("expected_state present but input.state empty returns invalid_state", async () => {
     const {
       oauthImplementations,
       findByMcpServerAndUser,
@@ -1124,13 +1399,13 @@ describe("exchangeToken state CSRF validation", () => {
       code_verifier: "v",
       client_information: { client_id: "c" },
       tokens: null,
-      expected_state: "the-nonce",
+      expected_state: stateFor(SERVER_UUID),
     });
 
     const fetchSpy = vi.spyOn(globalThis, "fetch");
 
     const result = await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "C" }, // no state
+      { state: "", code: "C" },
       USER_ID,
     );
 
@@ -1144,7 +1419,7 @@ describe("exchangeToken state CSRF validation", () => {
     fetchSpy.mockRestore();
   });
 
-  it("expected_state matches but upstream returns OAuth error → expected_state preserved for retry", async () => {
+  it("expected_state matches but invalid_grant consumes the state", async () => {
     const {
       oauthImplementations,
       findByMcpServerAndUser,
@@ -1163,7 +1438,7 @@ describe("exchangeToken state CSRF validation", () => {
         token_endpoint: "https://upstream.example.com/token",
       },
       tokens: null,
-      expected_state: "the-nonce",
+      expected_state: stateFor(SERVER_UUID),
     });
 
     const fetchSpy = vi
@@ -1183,7 +1458,7 @@ describe("exchangeToken state CSRF validation", () => {
       });
 
     const result = await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "C", state: "the-nonce" },
+      { code: "C", state: stateFor(SERVER_UUID) },
       USER_ID,
     );
 
@@ -1192,18 +1467,12 @@ describe("exchangeToken state CSRF validation", () => {
       expect(result.error).toBe("invalid_grant");
     }
     expect(upsert).not.toHaveBeenCalled();
-    // Crucial: on upstream error the state nonce is NOT cleared so the user
-    // can retry the exchange without re-running the authorize flow.
-    expect(clearExpectedState).not.toHaveBeenCalled();
+    expect(clearExpectedState).toHaveBeenCalledWith(SERVER_UUID, USER_ID);
     fetchSpy.mockRestore();
   });
 
   // Regression test for the persistence bug found in code review: the
-  // tRPC `upsert` handler previously stripped `expected_state` before
-  // calling the repo, leaving the DB column NULL and silently disabling
-  // the CSRF check at `exchangeToken` (which then falls through the
-  // back-compat NULL branch). Pins the forward-through behaviour so a
-  // future refactor of the spread cannot regress it.
+  // tRPC `upsert` must forward expected_state for legacy session-upsert callers.
   it("frontend.oauth.upsert forwards expected_state to the repository", async () => {
     const { oauthImplementations, upsert, findServerByUuid } =
       await loadModule();
@@ -1407,16 +1676,24 @@ describe("oauthImplementations.startAuthorization", () => {
     // Now feed that persisted client_information into exchangeToken, as
     // if the browser had come back with an authorization code, and assert
     // the token POST sends the exact same redirect_uri byte-for-byte.
+    const callbackState = new URL(
+      startResult.data.authorization_url,
+    ).searchParams.get("state");
+    if (!callbackState) throw new Error("Authorization state missing");
+    const persistedDiscovery = upsert.mock.calls.find(
+      (call) => call[0]?.discovery_state,
+    )?.[0].discovery_state;
     findByMcpServerAndUser.mockResolvedValue({
       mcp_server_uuid: SERVER_UUID,
       code_verifier: "PKCE_VERIFIER",
       client_information: persistedClientInfo,
       tokens: null,
-      expected_state: null,
+      expected_state: callbackState,
+      discovery_state: persistedDiscovery,
     });
 
     const exchangeResult = await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "AUTH_CODE" },
+      { state: callbackState, code: "AUTH_CODE" },
       USER_ID,
     );
 
@@ -1584,7 +1861,7 @@ describe("oauthImplementations.startAuthorization", () => {
       });
 
     const exchangeResult = await oauthImplementations.exchangeToken(
-      { mcp_server_uuid: SERVER_UUID, code: "C", state: persistedState },
+      { code: "C", state: persistedState },
       USER_ID,
     );
 

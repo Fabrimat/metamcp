@@ -11,6 +11,13 @@
 // is known ahead of time (either from pre-registered client_information or
 // from discovery against the protected resource).
 
+import {
+  type OAuthClientProvider,
+  selectResourceURL,
+} from "@modelcontextprotocol/sdk/client/auth.js";
+import { OAuthProtectedResourceMetadataSchema } from "@modelcontextprotocol/sdk/shared/auth.js";
+import { z } from "zod";
+
 import logger from "../../utils/logger";
 
 export type TokenEndpointAuthMethod =
@@ -24,6 +31,11 @@ export interface OAuthTokens {
   expires_in?: number;
   scope?: string;
   refresh_token?: string;
+  // Absolute expiry (ms since epoch), computed by `withExpiresAt` below.
+  // Not part of any upstream response — MetaMCP's own bookkeeping field
+  // so the proactive-refresh gate in client.ts can act on a known expiry
+  // instead of the upstream's HTTP status code.
+  expires_at?: number;
   // Some providers (Salesforce, Microsoft) include additional fields like
   // `id_token`, `instance_url`, `signature`, etc. We keep them via index
   // signature so the jsonb round-trip preserves them.
@@ -157,6 +169,7 @@ export interface ExchangeAuthorizationCodeInput {
   clientId: string;
   clientSecret?: string;
   authMethod: TokenEndpointAuthMethod;
+  resource?: string | URL;
   fetchImpl?: typeof fetch;
 }
 
@@ -169,6 +182,7 @@ export async function exchangeAuthorizationCode(
     code_verifier: input.codeVerifier,
     redirect_uri: input.redirectUri,
   });
+  if (input.resource) params.set("resource", String(input.resource));
 
   return postFormToToken({
     tokenEndpoint: input.tokenEndpoint,
@@ -187,6 +201,7 @@ export interface RefreshAccessTokenInput {
   clientSecret?: string;
   authMethod: TokenEndpointAuthMethod;
   scope?: string;
+  resource?: string | URL;
   fetchImpl?: typeof fetch;
 }
 
@@ -200,6 +215,7 @@ export async function refreshAccessToken(
   if (input.scope) {
     params.set("scope", input.scope);
   }
+  if (input.resource) params.set("resource", String(input.resource));
 
   const tokens = await postFormToToken({
     tokenEndpoint: input.tokenEndpoint,
@@ -219,6 +235,38 @@ export async function refreshAccessToken(
   return tokens;
 }
 
+// Absolute expiry (ms since epoch), computed from `expires_in` at the
+// moment the token response is received. Persisted alongside the tokens
+// (`oauth_sessions.tokens.expires_at`) so a proactive refresh can run
+// BEFORE the next connection attempt, independent of the upstream's HTTP
+// status code on that attempt — see the doc comment on the
+// proactive-refresh gate in apps/backend/src/lib/metamcp/client.ts for
+// why status-code-based refresh is unreachable for some upstreams (e.g.
+// Reclaim.ai's bare 403 with no WWW-Authenticate header and no OAuth
+// error envelope, identical for an expired token and a real permission
+// denial).
+//
+// RFC 6749 §4.2.2/§5.1: `expires_in` is OPTIONAL. When the upstream omits
+// it, expiry is unknown — never guess a default TTL.
+//
+// Single source of truth: called from BOTH token-persisting call sites
+// (oauth.impl.ts's exchangeToken and refresh-on-401.ts's doRefresh) so
+// this arithmetic lives in exactly one place.
+//
+// Constraint includes `access_token` (not just `expires_in`) so it isn't
+// a TS "weak type" (all-optional) — every real token object has one, and
+// without it TS's weak-type check (TS2559/TS2353) rejects any argument
+// that doesn't already carry `expires_in`, which is exactly the omitted-
+// `expires_in` case this function needs to accept.
+export function withExpiresAt<
+  T extends { access_token: string; expires_in?: number },
+>(tokens: T): T & { expires_at?: number } {
+  if (typeof tokens.expires_in !== "number") {
+    return tokens;
+  }
+  return { ...tokens, expires_at: Date.now() + tokens.expires_in * 1000 };
+}
+
 export interface OAuthAuthorizationServerMetadata {
   issuer?: string;
   authorization_endpoint?: string;
@@ -227,6 +275,70 @@ export interface OAuthAuthorizationServerMetadata {
   scopes_supported?: string[];
   token_endpoint_auth_methods_supported?: string[];
   grant_types_supported?: string[];
+}
+
+const persistedDiscoverySchema = z.object({
+  authorizationServerUrl: z.string().url(),
+  authorizationServerMetadata: z
+    .object({
+      token_endpoint: z.string().url().optional(),
+      token_endpoint_auth_methods_supported: z.array(z.string()).optional(),
+    })
+    .passthrough()
+    .optional(),
+  resourceMetadata: OAuthProtectedResourceMetadataSchema.optional(),
+});
+
+function requireHttpUrl(value: string): string {
+  const url = new URL(value);
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error("OAuth endpoints must use HTTP or HTTPS");
+  }
+  return value;
+}
+
+// Exchange and refresh must use the authorization server and resource selected
+// during authorize. Never rediscover from the resource origin when state exists.
+export async function resolveOAuthTokenContext(args: {
+  serverUrl: string;
+  clientInformation: Record<string, unknown> | null;
+  provider: OAuthClientProvider;
+  discoveryState: unknown;
+}) {
+  try {
+    const configuredEndpoint = args.clientInformation?.token_endpoint;
+    if (typeof configuredEndpoint === "string" && configuredEndpoint) {
+      requireHttpUrl(configuredEndpoint);
+    }
+    const saved = args.discoveryState;
+    const state =
+      saved == null ? undefined : persistedDiscoverySchema.parse(saved);
+    if (state) requireHttpUrl(state.authorizationServerUrl);
+    const discovered = state
+      ? (state.authorizationServerMetadata ?? null)
+      : await discoverAuthorizationServerMetadata(args.serverUrl);
+    const tokenEndpoint = requireHttpUrl(
+      resolveTokenEndpoint({
+        clientInformation: args.clientInformation,
+        discovered,
+        serverUrl: state?.authorizationServerUrl ?? args.serverUrl,
+      }),
+    );
+    const resource = await selectResourceURL(
+      args.serverUrl,
+      args.provider,
+      state?.resourceMetadata,
+    );
+    return { tokenEndpoint, discovered, resource };
+  } catch (error) {
+    throw new UpstreamTokenError(0, {
+      error: "invalid_discovery_state",
+      error_description:
+        error instanceof Error
+          ? error.message
+          : "Invalid OAuth discovery state",
+    });
+  }
 }
 
 // Server-side discovery against `/.well-known/oauth-authorization-server`.

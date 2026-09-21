@@ -18,11 +18,8 @@
 // DCR + the authorize redirect itself.
 //
 // Constructed fresh per `startAuthorization` tRPC call
-// (apps/backend/src/trpc/oauth.impl.ts). NOT used for token exchange or
-// refresh — those read/write oauth_sessions directly without going
-// through an OAuthClientProvider.
-import { randomBytes } from "node:crypto";
-
+// (apps/backend/src/trpc/oauth.impl.ts). Exchange and refresh also pass this
+// provider to the SDK resource selector, while persisting tokens directly.
 import {
   OAuthClientProvider,
   OAuthDiscoveryState,
@@ -37,6 +34,7 @@ import {
 import { oauthSessionsRepository } from "../../db/repositories";
 import { resolveRedirectUri } from "../../trpc/pre-registered-oauth";
 import logger from "../../utils/logger";
+import { createUpstreamState } from "./state";
 import { redactToken } from "./token-exchange";
 
 export interface OAuthUpstreamClientProviderOptions {
@@ -173,7 +171,11 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
   // Persisted so exchangeToken (oauth.impl.ts) can validate the round
   // trip when the upstream redirects back.
   async state(): Promise<string> {
-    const stateValue = randomBytes(16).toString("base64url");
+    // The SDK does not re-save complete cached (including synthesized
+    // pre-registered) discovery. Persist the context used for this redirect.
+    const discovery = await this.discoveryState();
+    if (discovery) await this.saveDiscoveryState(discovery);
+    const stateValue = createUpstreamState(this.mcpServerUuid);
     await oauthSessionsRepository.upsert({
       mcp_server_uuid: this.mcpServerUuid,
       user_id: this.userId,
@@ -198,26 +200,6 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
     return session.code_verifier;
   }
 
-  // RFC 8707 Resource Indicator. MetaMCP's token-exchange POST
-  // (token-exchange.ts `exchangeAuthorizationCode`) does not send
-  // `resource`. Threading a selected resource through both legs would
-  // require persisting it across the authorize/exchange boundary (two
-  // separate tRPC calls with oauth_sessions as the only shared state), and
-  // no column exists for it — adding one is out of this brief's scope;
-  // oauth-sessions.repo.ts and its migrations are owned by an earlier
-  // brief. Recomputing it independently at exchange time would add a
-  // second live HTTP round-trip to the upstream's protected-resource
-  // endpoint on every token exchange for marginal benefit.
-  // ponytail: omit `resource` on BOTH legs (authorize AND token) rather
-  // than send it on only one — an authorize-sends-it/token-doesn't
-  // asymmetry is what audience-enforcing authorization servers actually
-  // reject. Upgrade path: add an oauth_sessions column for the selected
-  // resource and thread it into exchangeAuthorizationCode's params if a
-  // real upstream turns up that requires the parameter on both legs.
-  async validateResourceURL(): Promise<URL | undefined> {
-    return undefined;
-  }
-
   // Bootstraps `auth()` from the pre-registered authorization_endpoint /
   // token_endpoint fields (see pre-registered-oauth.ts /
   // buildPreRegisteredClientInformation) instead of running RFC 9728 +
@@ -228,19 +210,13 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
   // field only ever affected the (already server-side) token-exchange path.
   //
   // Also synthesizes a minimal `resourceMetadata` (just the `resource`
-  // field) solely to short-circuit the SDK's fallback RFC 9728 fetch that
-  // runs when resourceMetadata is absent from cached discovery state (see
-  // `authInternal` in the SDK's client/auth.js) — its `resource` value is
-  // never read since validateResourceURL above always returns undefined.
+  // field) to avoid discovery for explicitly configured endpoints. The SDK
+  // validates and selects this resource for authorize, exchange and refresh.
   //
-  // Returns undefined (falls through to normal discovery) unless BOTH
-  // endpoints are present, matching buildPreRegisteredClientInformation's
-  // "populate together" convention.
+  // Complete pre-registered endpoints take precedence, followed by persisted
+  // discovery. With neither available, the SDK performs normal discovery.
   async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
     const session = await this.loadSession();
-    if (session?.discovery_state) {
-      return session.discovery_state as unknown as OAuthDiscoveryState;
-    }
     const ci = clientInfoAsRecord(session?.client_information);
     const authorizationEndpoint =
       typeof ci?.authorization_endpoint === "string"
@@ -249,7 +225,9 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
     const tokenEndpoint =
       typeof ci?.token_endpoint === "string" ? ci.token_endpoint : undefined;
     if (!authorizationEndpoint || !tokenEndpoint) {
-      return undefined;
+      return (session?.discovery_state ?? undefined) as unknown as
+        | OAuthDiscoveryState
+        | undefined;
     }
 
     let authorizationServerUrl: string;

@@ -1,8 +1,46 @@
 import {
+  ExchangeOAuthTokenRequestSchema,
+  ExchangeOAuthTokenResponseSchema,
   OAuthClientInfoRequestSchema,
   OAuthClientInformationSchema,
+  OAuthSessionUpdateInputSchema,
 } from "@repo/zod-types";
 import { describe, expect, it } from "vitest";
+
+describe("upstream callback contract", () => {
+  it("requires state and routes using state only", () => {
+    expect(
+      ExchangeOAuthTokenRequestSchema.parse({ code: "C", state: "S" }),
+    ).toEqual({ code: "C", state: "S" });
+    expect(
+      ExchangeOAuthTokenRequestSchema.safeParse({
+        code: "C",
+        mcp_server_uuid: "00000000-0000-4000-8000-000000000003",
+      }).success,
+    ).toBe(false);
+    expect(
+      ExchangeOAuthTokenRequestSchema.safeParse({ code: "C", state: "" })
+        .success,
+    ).toBe(false);
+  });
+  it("returns the server UUID in the successful response", () => {
+    const result = {
+      success: true,
+      data: { mcp_server_uuid: "00000000-0000-4000-8000-000000000003" },
+      message: "OK",
+    };
+    expect(ExchangeOAuthTokenResponseSchema.parse(result)).toEqual(result);
+  });
+  it("rejects null discovery updates instead of silently ignoring them", () => {
+    expect(
+      OAuthSessionUpdateInputSchema.safeParse({
+        mcp_server_uuid: "00000000-0000-4000-8000-000000000003",
+        user_id: "user-a",
+        discovery_state: null,
+      }).success,
+    ).toBe(false);
+  });
+});
 
 describe("OAuthClientInfoRequestSchema", () => {
   it("accepts an entirely empty payload (the section was untouched)", () => {
@@ -66,6 +104,58 @@ describe("OAuthClientInfoRequestSchema", () => {
         "https://login.salesforce.com/services/oauth2/authorize",
       token_endpoint: "https://login.salesforce.com/services/oauth2/token",
       token_endpoint_auth_method: "client_secret_post",
+    });
+    expect(result.success).toBe(true);
+  });
+});
+
+// Table-driven pin for the per-server redirect_uri override's loopback-only
+// validation (Brief A). Verified live against Reclaim.ai's RFC 7591 DCR
+// endpoint (https://api.app.reclaim.ai/oauth2/register) for the base
+// accept/reject cases; `http://[::1]:...` is accepted here even though
+// Reclaim itself rejects it (RFC 8252 §8.3 loopback, upstream's choice to
+// reject it), and any fragment is rejected regardless of host.
+describe("OAuthClientInfoRequestSchema redirect_uri (loopback validation)", () => {
+  it.each([
+    ["http://127.0.0.1:33418/callback"],
+    ["http://localhost:12008/fe-oauth/callback"],
+    ["http://127.0.0.1/cb"],
+    ["http://[::1]:33418/cb"],
+  ])("accepts %s", (redirect_uri) => {
+    const result = OAuthClientInfoRequestSchema.safeParse({ redirect_uri });
+    expect(result.success).toBe(true);
+  });
+
+  it.each([
+    ["https://example.com/cb"],
+    ["https://127.0.0.1:33418/cb"],
+    ["http://127.0.0.2:33418/cb"],
+    ["urn:ietf:wg:oauth:2.0:oob"],
+    ["http://evil.com/cb"],
+    ["http://127.0.0.1:33418/cb#frag"],
+  ])("rejects %s", (redirect_uri) => {
+    const result = OAuthClientInfoRequestSchema.safeParse({ redirect_uri });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.path).toContain("redirect_uri");
+    }
+  });
+
+  it("accepts an unset redirect_uri (blank is allowed)", () => {
+    expect(OAuthClientInfoRequestSchema.safeParse({}).success).toBe(true);
+    expect(
+      OAuthClientInfoRequestSchema.safeParse({ redirect_uri: "" }).success,
+    ).toBe(true);
+  });
+
+  // Design decision: redirect_uri must NOT trip the "client_id becomes
+  // required" refinement, because an upstream that only accepts loopback
+  // redirect URIs (Reclaim.ai) can still support RFC 7591 dynamic client
+  // registration — the user only needs to override redirect_uri, not
+  // pre-register a client.
+  it("accepts redirect_uri set alone, with no client_id", () => {
+    const result = OAuthClientInfoRequestSchema.safeParse({
+      redirect_uri: "http://127.0.0.1:33418/callback",
     });
     expect(result.success).toBe(true);
   });

@@ -9,6 +9,7 @@ import {
   resolveTokenEndpoint,
   resolveTokenEndpointAuthMethod,
   UpstreamTokenError,
+  withExpiresAt,
 } from "./token-exchange";
 
 type FetchImpl = typeof fetch;
@@ -48,6 +49,25 @@ describe("exchangeAuthorizationCode", () => {
     clientId: "3MVG9.Salesforce",
     authMethod: "none" as const,
   };
+
+  it.each([
+    undefined,
+    "https://resource.example/mcp",
+    new URL("https://resource.example/mcp"),
+  ])("sends resource only when supplied: %s", async (resource) => {
+    const fetchImpl = vi.fn<FetchImpl>(async (_url, init) => {
+      const body = init?.body as URLSearchParams;
+      expect(body.get("resource")).toBe(
+        resource ? "https://resource.example/mcp" : null,
+      );
+      if (resource)
+        expect(body.toString()).toContain(
+          "resource=https%3A%2F%2Fresource.example%2Fmcp",
+        );
+      return jsonResponse(200, { access_token: "AT", token_type: "Bearer" });
+    });
+    await exchangeAuthorizationCode({ ...baseInput, resource, fetchImpl });
+  });
 
   it("POSTs the expected form-encoded body and persists tokens", async () => {
     const fetchImpl = vi.fn<FetchImpl>(async (url, init) => {
@@ -191,6 +211,31 @@ describe("exchangeAuthorizationCode", () => {
 });
 
 describe("refreshAccessToken", () => {
+  it.each([
+    undefined,
+    "https://resource.example/mcp",
+    new URL("https://resource.example/mcp"),
+  ])("sends resource only when supplied: %s", async (resource) => {
+    const fetchImpl = vi.fn<FetchImpl>(async (_url, init) => {
+      const body = init?.body as URLSearchParams;
+      expect(body.get("resource")).toBe(
+        resource ? "https://resource.example/mcp" : null,
+      );
+      if (resource)
+        expect(body.toString()).toContain(
+          "resource=https%3A%2F%2Fresource.example%2Fmcp",
+        );
+      return jsonResponse(200, { access_token: "AT", token_type: "Bearer" });
+    });
+    await refreshAccessToken({
+      tokenEndpoint: "https://auth.example/token",
+      refreshToken: "RT",
+      clientId: "client",
+      authMethod: "none",
+      resource,
+      fetchImpl,
+    });
+  });
   it("preserves the original refresh_token when the upstream omits it", async () => {
     const fetchImpl = vi.fn<FetchImpl>(async (_url, init) => {
       const body = init?.body as URLSearchParams;
@@ -251,6 +296,41 @@ describe("refreshAccessToken", () => {
 
     expect(err).toBeInstanceOf(UpstreamTokenError);
     expect((err as UpstreamTokenError).oauthError?.error).toBe("invalid_grant");
+  });
+});
+
+describe("withExpiresAt", () => {
+  it("computes an absolute expiry from expires_in at the current moment", () => {
+    const before = Date.now();
+    const result = withExpiresAt({
+      access_token: "AT",
+      token_type: "Bearer",
+      expires_in: 3600,
+    });
+    const after = Date.now();
+    expect(result.expires_at).toBeDefined();
+    expect(result.expires_at as number).toBeGreaterThanOrEqual(
+      before + 3600 * 1000,
+    );
+    expect(result.expires_at as number).toBeLessThanOrEqual(
+      after + 3600 * 1000,
+    );
+  });
+
+  it("leaves expires_at unset when expires_in is omitted (RFC 6749: OPTIONAL)", () => {
+    const result = withExpiresAt({
+      access_token: "AT",
+      token_type: "Bearer",
+    });
+    expect(result.expires_at).toBeUndefined();
+    expect("expires_at" in result).toBe(false);
+  });
+
+  it("does not mutate the input object", () => {
+    const input = { access_token: "AT", token_type: "Bearer", expires_in: 60 };
+    const result = withExpiresAt(input);
+    expect(input).not.toHaveProperty("expires_at");
+    expect(result).not.toBe(input);
   });
 });
 

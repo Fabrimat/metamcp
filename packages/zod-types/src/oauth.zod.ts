@@ -218,17 +218,14 @@ export const UpsertOAuthSessionResponseSchema = z.union([
 // against most enterprise providers (Salesforce, Okta, Auth0, ...).
 //
 // Note: the upstream server URL is NOT accepted from the caller. The
-// backend resolves it from the `mcp_servers` row keyed by mcp_server_uuid
+// backend resolves it from the `mcp_servers` row keyed by the UUID in state
 // to prevent an authenticated user from steering discovery + token POST
 // at an attacker-controlled host (SSRF / authorization-code exfiltration).
 export const ExchangeOAuthTokenRequestSchema = z.object({
-  mcp_server_uuid: z.string().uuid(),
   // Authorization code returned in the redirect query string.
   code: z.string().min(1, "code is required"),
-  // Optional `state` parameter for CSRF defense. Echoed back from the
-  // upstream redirect. Validated against an expected value when MetaMCP
-  // gains per-flow state tracking (separate work).
-  state: z.string().optional(),
+  // Self-identifying state, verified against the caller's persisted session.
+  state: z.string().min(1, "state is required"),
 });
 
 // Upstream OAuth error envelope (RFC 6749 §5.2). Surfaced to the frontend
@@ -242,6 +239,7 @@ export const UpstreamOAuthErrorSchema = z.object({
 export const ExchangeOAuthTokenResponseSchema = z.union([
   z.object({
     success: z.literal(true),
+    data: z.object({ mcp_server_uuid: z.string().uuid() }),
     message: z.string(),
   }),
   z.object({
@@ -339,7 +337,8 @@ export const OAuthSessionUpdateInputSchema = OAuthSessionKeySchema.extend({
   tokens: UpstreamTokenResponseSchema.nullable().optional(),
   code_verifier: z.string().nullable().optional(),
   expected_state: z.string().optional(),
-  discovery_state: OAuthDiscoveryStateSchema.nullable().optional(),
+  // Omit preserves discovery; null is not a supported clear operation.
+  discovery_state: OAuthDiscoveryStateSchema.optional(),
 });
 
 // Export repository types

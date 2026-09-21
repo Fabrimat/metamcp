@@ -43,6 +43,42 @@ describe("tryRefreshUpstreamTokens", () => {
     vi.restoreAllMocks();
   });
 
+  it("refreshes from persisted discovery without fetching the resource origin", async () => {
+    const { tryRefreshUpstreamTokens, findByMcpServerAndUser } =
+      await loadModule();
+    findByMcpServerAndUser.mockResolvedValue({
+      client_information: { client_id: "client" },
+      tokens: {
+        access_token: "OLD",
+        token_type: "Bearer",
+        refresh_token: "RT",
+      },
+      discovery_state: {
+        authorizationServerUrl: "https://auth.example.com",
+        authorizationServerMetadata: {
+          issuer: "https://auth.example.com",
+          authorization_endpoint: "https://auth.example.com/authorize",
+          token_endpoint: "https://auth.example.com/token",
+          response_types_supported: ["code"],
+        },
+        resourceMetadata: { resource: "https://api.example.com/mcp" },
+      },
+    });
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async () =>
+        jsonResponse(200, { access_token: "NEW", token_type: "Bearer" }),
+      );
+    expect(
+      await tryRefreshUpstreamTokens({ ...SERVER, oauth_user_id: USER_ID }),
+    ).toMatchObject({ status: "refreshed" });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy.mock.calls[0]?.[0]).toBe("https://auth.example.com/token");
+    expect(
+      (fetchSpy.mock.calls[0]?.[1]?.body as URLSearchParams).get("resource"),
+    ).toBe("https://api.example.com/mcp");
+  });
+
   it("returns refreshed and persists new tokens on upstream 200", async () => {
     const { tryRefreshUpstreamTokens, findByMcpServerAndUser, upsert } =
       await loadModule();
