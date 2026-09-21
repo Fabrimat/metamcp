@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock logger to avoid path alias resolution issues in tests, and to keep
 // the test output quiet.
@@ -9,8 +9,9 @@ vi.mock("@/utils/logger", () => ({
 // vi.mock factories are hoisted above all other top-level statements, so
 // anything they reference must go through vi.hoisted() rather than a
 // plain top-level const (see https://vitest.dev/api/vi.html#vi-hoisted).
-const { findByMcpServerAndUser, SERVER_ROW } = vi.hoisted(() => ({
+const { findByMcpServerAndUser, queryRows, SERVER_ROW } = vi.hoisted(() => ({
   findByMcpServerAndUser: vi.fn(),
+  queryRows: vi.fn(),
   SERVER_ROW: {
     uuid: "11111111-1111-1111-1111-111111111111",
     name: "reclaim",
@@ -26,7 +27,8 @@ const { findByMcpServerAndUser, SERVER_ROW } = vi.hoisted(() => ({
     forward_headers: {},
     status: "ACTIVE",
     error_status: "NONE",
-    oauth_user_id: "user-1",
+    namespace_user_id: "user-1",
+    server_user_id: null,
   },
 }));
 
@@ -47,7 +49,7 @@ vi.mock("../../db/index", () => ({
       from: () => {
         const query = {
           innerJoin: () => query,
-          where: async () => [SERVER_ROW],
+          where: queryRows,
         };
         return query;
       },
@@ -58,6 +60,10 @@ vi.mock("../../db/index", () => ({
 import { getMcpServers } from "./fetch-metamcp";
 
 describe("getMcpServers — expires_at must survive into ServerParameters.oauth_tokens", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    queryRows.mockResolvedValue([SERVER_ROW]);
+  });
   // This pins the specific trap called out in the proactive-refresh design:
   // getMcpServers copies oauth_sessions.tokens into ServerParameters.oauth_tokens
   // field-by-field (not a spread). A test that only checks the arithmetic
@@ -101,6 +107,99 @@ describe("getMcpServers — expires_at must survive into ServerParameters.oauth_
     findByMcpServerAndUser.mockResolvedValue(undefined);
 
     const servers = await getMcpServers("namespace-uuid");
+    expect(servers[SERVER_ROW.uuid].oauth_tokens).toBeNull();
+  });
+});
+
+describe("getMcpServers — namespace OAuth principal", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("loads separate sessions when the same public server is mapped into two user-owned namespaces", async () => {
+    queryRows
+      .mockResolvedValueOnce([
+        {
+          ...SERVER_ROW,
+          namespace_user_id: "namespace-owner-a",
+          server_user_id: null,
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          ...SERVER_ROW,
+          namespace_user_id: "namespace-owner-b",
+          server_user_id: null,
+        },
+      ]);
+    findByMcpServerAndUser
+      .mockResolvedValueOnce({
+        tokens: { access_token: "TOKEN_A", token_type: "Bearer" },
+      })
+      .mockResolvedValueOnce({
+        tokens: { access_token: "TOKEN_B", token_type: "Bearer" },
+      });
+
+    const namespaceA = await getMcpServers("namespace-a");
+    const namespaceB = await getMcpServers("namespace-b");
+
+    expect(findByMcpServerAndUser).toHaveBeenNthCalledWith(
+      1,
+      SERVER_ROW.uuid,
+      "namespace-owner-a",
+    );
+    expect(findByMcpServerAndUser).toHaveBeenNthCalledWith(
+      2,
+      SERVER_ROW.uuid,
+      "namespace-owner-b",
+    );
+    expect(namespaceA[SERVER_ROW.uuid].oauth_user_id).toBe("namespace-owner-a");
+    expect(namespaceA[SERVER_ROW.uuid].oauth_tokens?.access_token).toBe(
+      "TOKEN_A",
+    );
+    expect(namespaceB[SERVER_ROW.uuid].oauth_user_id).toBe("namespace-owner-b");
+    expect(namespaceB[SERVER_ROW.uuid].oauth_tokens?.access_token).toBe(
+      "TOKEN_B",
+    );
+  });
+
+  it("falls back to the private server owner when the namespace is public", async () => {
+    queryRows.mockResolvedValue([
+      {
+        ...SERVER_ROW,
+        namespace_user_id: null,
+        server_user_id: "server-owner",
+      },
+    ]);
+    findByMcpServerAndUser.mockResolvedValue({
+      tokens: { access_token: "SERVER_TOKEN", token_type: "Bearer" },
+    });
+
+    const servers = await getMcpServers("public-namespace");
+
+    expect(findByMcpServerAndUser).toHaveBeenCalledWith(
+      SERVER_ROW.uuid,
+      "server-owner",
+    );
+    expect(servers[SERVER_ROW.uuid].oauth_user_id).toBe("server-owner");
+    expect(servers[SERVER_ROW.uuid].oauth_tokens?.access_token).toBe(
+      "SERVER_TOKEN",
+    );
+  });
+
+  it("does not query OAuth sessions when both namespace and server are public", async () => {
+    queryRows.mockResolvedValue([
+      {
+        ...SERVER_ROW,
+        namespace_user_id: null,
+        server_user_id: null,
+      },
+    ]);
+
+    const servers = await getMcpServers("public-namespace");
+
+    expect(findByMcpServerAndUser).not.toHaveBeenCalled();
+    expect(servers[SERVER_ROW.uuid].oauth_user_id).toBeUndefined();
     expect(servers[SERVER_ROW.uuid].oauth_tokens).toBeNull();
   });
 });

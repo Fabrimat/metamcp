@@ -61,9 +61,12 @@ export const inFlightRefreshes = new Map<string, Promise<RefreshResult>>();
 // NOTE: This is intentionally safe to call repeatedly — it short-circuits
 // when there is no refresh_token or no client_id to use.
 export async function tryRefreshUpstreamTokens(
-  serverParams: Pick<ServerParameters, "uuid" | "name" | "url">,
-  userId?: string,
+  serverParams: Pick<
+    ServerParameters,
+    "uuid" | "name" | "url" | "oauth_user_id"
+  >,
 ): Promise<RefreshResult> {
+  const userId = serverParams.oauth_user_id;
   if (!userId) {
     return { status: "no_session" };
   }
@@ -87,7 +90,10 @@ export async function tryRefreshUpstreamTokens(
 }
 
 async function doRefresh(
-  serverParams: Pick<ServerParameters, "uuid" | "name" | "url">,
+  serverParams: Pick<
+    ServerParameters,
+    "uuid" | "name" | "url" | "oauth_user_id"
+  >,
   userId: string,
 ): Promise<RefreshResult> {
   if (!serverParams.url) {

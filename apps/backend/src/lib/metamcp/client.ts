@@ -200,6 +200,7 @@ export async function refreshIfExpiringSoon(
   const tokens = serverParams.oauth_tokens;
   if (
     !isHttpServer ||
+    !serverParams.oauth_user_id ||
     !tokens?.refresh_token ||
     typeof tokens.expires_at !== "number" ||
     tokens.expires_at - Date.now() >= EXPIRY_REFRESH_BUFFER_MS
@@ -220,10 +221,7 @@ export async function refreshIfExpiringSoon(
   // refresh-endpoint hiccup. The reactive 401-refresh cascade further down
   // is still there as a second line of defence if this attempt does 401.
   try {
-    const refresh = await tryRefreshUpstreamTokens(
-      serverParams,
-      serverParams.oauth_user_id ?? undefined,
-    );
+    const refresh = await tryRefreshUpstreamTokens(serverParams);
     if (refresh.status === "refreshed" && refresh.tokens) {
       serverParams.oauth_tokens = {
         access_token: refresh.tokens.access_token,
@@ -462,14 +460,12 @@ export const connectMetaMcpClient = async (
       //    we fall through.
       if (
         isHttpServer &&
+        serverParams.oauth_user_id &&
         serverParams.oauth_tokens?.refresh_token &&
         isUpstreamUnauthorizedError(error)
       ) {
         try {
-          const refresh = await tryRefreshUpstreamTokens(
-            serverParams,
-            serverParams.oauth_user_id ?? undefined,
-          );
+          const refresh = await tryRefreshUpstreamTokens(serverParams);
           if (refresh.status === "refreshed" && refresh.tokens) {
             serverParams.oauth_tokens = {
               access_token: refresh.tokens.access_token,

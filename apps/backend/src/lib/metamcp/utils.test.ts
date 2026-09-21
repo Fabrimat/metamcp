@@ -1,5 +1,5 @@
 import type { DatabaseMcpServer } from "@repo/zod-types";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/utils/logger", () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -39,6 +39,9 @@ const DB_SERVER: DatabaseMcpServer = {
 };
 
 describe("convertDbServerToParams — expires_at must survive into ServerParameters.oauth_tokens", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
   // Same trap as getMcpServers (fetch-metamcp.test.ts), a second call site
   // used by startup.ts's idle-session warm-up and mcp-servers.impl.ts's
   // create/update paths. A test that only reverts fetch-metamcp.ts's copy
@@ -72,5 +75,36 @@ describe("convertDbServerToParams — expires_at must survive into ServerParamet
 
     const params = await convertDbServerToParams(DB_SERVER);
     expect(params?.oauth_tokens?.expires_at).toBeUndefined();
+  });
+});
+
+describe("convertDbServerToParams — direct-server OAuth principal", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("uses a private server's owner to load and carry its OAuth session", async () => {
+    findByMcpServerAndUser.mockResolvedValue({
+      tokens: { access_token: "PRIVATE_TOKEN", token_type: "Bearer" },
+    });
+
+    const params = await convertDbServerToParams(DB_SERVER);
+
+    expect(findByMcpServerAndUser).toHaveBeenCalledWith(
+      DB_SERVER.uuid,
+      "user-1",
+    );
+    expect(params?.oauth_user_id).toBe("user-1");
+    expect(params?.oauth_tokens?.access_token).toBe("PRIVATE_TOKEN");
+  });
+
+  it("does not guess a principal or load OAuth tokens for a public server without a caller principal", async () => {
+    const publicServer: DatabaseMcpServer = { ...DB_SERVER, user_id: null };
+
+    const params = await convertDbServerToParams(publicServer);
+
+    expect(findByMcpServerAndUser).not.toHaveBeenCalled();
+    expect(params?.oauth_user_id).toBeUndefined();
+    expect(params?.oauth_tokens).toBeNull();
   });
 });

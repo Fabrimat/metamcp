@@ -73,7 +73,10 @@ describe("tryRefreshUpstreamTokens", () => {
       });
     });
 
-    const result = await tryRefreshUpstreamTokens(SERVER, USER_ID);
+    const result = await tryRefreshUpstreamTokens({
+      ...SERVER,
+      oauth_user_id: USER_ID,
+    });
     expect(result.status).toBe("refreshed");
     expect(result.tokens?.access_token).toBe("NEW");
     // Refresh token preserved per RFC 6749 §6.
@@ -119,7 +122,10 @@ describe("tryRefreshUpstreamTokens", () => {
       });
     });
 
-    const result = await tryRefreshUpstreamTokens(SERVER, USER_ID);
+    const result = await tryRefreshUpstreamTokens({
+      ...SERVER,
+      oauth_user_id: USER_ID,
+    });
     expect(result.status).toBe("refreshed");
     expect(result.tokens?.expires_at).toBeGreaterThanOrEqual(
       before + 3600 * 1000,
@@ -160,7 +166,10 @@ describe("tryRefreshUpstreamTokens", () => {
       return jsonResponse(200, { access_token: "NEW", token_type: "Bearer" });
     });
 
-    const result = await tryRefreshUpstreamTokens(SERVER, USER_ID);
+    const result = await tryRefreshUpstreamTokens({
+      ...SERVER,
+      oauth_user_id: USER_ID,
+    });
     expect(result.tokens?.expires_at).toBeUndefined();
     expect(upsert).toHaveBeenCalledTimes(1);
     const persisted = upsert.mock.calls[0][0] as {
@@ -173,9 +182,84 @@ describe("tryRefreshUpstreamTokens", () => {
     const { tryRefreshUpstreamTokens, findByMcpServerAndUser, upsert } =
       await loadModule();
     findByMcpServerAndUser.mockResolvedValue(undefined);
-    const result = await tryRefreshUpstreamTokens(SERVER, USER_ID);
+    const result = await tryRefreshUpstreamTokens({
+      ...SERVER,
+      oauth_user_id: USER_ID,
+    });
     expect(result.status).toBe("no_session");
     expect(upsert).not.toHaveBeenCalled();
+  });
+
+  it("requires the OAuth principal carried by ServerParameters", async () => {
+    const { tryRefreshUpstreamTokens, findByMcpServerAndUser, upsert } =
+      await loadModule();
+
+    const result = await tryRefreshUpstreamTokens(SERVER);
+
+    expect(result.status).toBe("no_session");
+    expect(findByMcpServerAndUser).not.toHaveBeenCalled();
+    expect(upsert).not.toHaveBeenCalled();
+  });
+
+  it("separates in-flight refreshes by OAuth principal while coalescing duplicates for the same pair", async () => {
+    const { tryRefreshUpstreamTokens, findByMcpServerAndUser, upsert } =
+      await loadModule();
+    findByMcpServerAndUser.mockImplementation(
+      async (_serverUuid: string, userId: string) => ({
+        mcp_server_uuid: SERVER.uuid,
+        user_id: userId,
+        client_information: {
+          client_id: `client-${userId}`,
+          token_endpoint: "https://upstream/token",
+        },
+        tokens: {
+          access_token: `OLD-${userId}`,
+          token_type: "Bearer",
+          refresh_token: `RT-${userId}`,
+        },
+        code_verifier: null,
+      }),
+    );
+    upsert.mockResolvedValue({});
+
+    let tokenPostCount = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      const urlStr = typeof url === "string" ? url : (url as URL).toString();
+      if (urlStr.includes("/.well-known/")) {
+        return new Response("nope", { status: 404 });
+      }
+      tokenPostCount += 1;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return jsonResponse(200, {
+        access_token: `NEW-${tokenPostCount}`,
+        token_type: "Bearer",
+      });
+    });
+
+    const serverA = { ...SERVER, oauth_user_id: "user-a" };
+    const serverB = { ...SERVER, oauth_user_id: "user-b" };
+    const results = await Promise.all([
+      tryRefreshUpstreamTokens(serverA),
+      tryRefreshUpstreamTokens(serverA),
+      tryRefreshUpstreamTokens(serverB),
+    ]);
+
+    expect(results.map((result) => result.status)).toEqual([
+      "refreshed",
+      "refreshed",
+      "refreshed",
+    ]);
+    expect(tokenPostCount).toBe(2);
+    expect(findByMcpServerAndUser).toHaveBeenCalledTimes(2);
+    expect(findByMcpServerAndUser).toHaveBeenCalledWith(SERVER.uuid, "user-a");
+    expect(findByMcpServerAndUser).toHaveBeenCalledWith(SERVER.uuid, "user-b");
+    expect(upsert).toHaveBeenCalledTimes(2);
+    expect(upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ user_id: "user-a" }),
+    );
+    expect(upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ user_id: "user-b" }),
+    );
   });
 
   it("returns no_refresh_token when session has tokens but no refresh_token", async () => {
@@ -186,7 +270,10 @@ describe("tryRefreshUpstreamTokens", () => {
       client_information: { client_id: "c1" },
       tokens: { access_token: "x", token_type: "Bearer" },
     });
-    const result = await tryRefreshUpstreamTokens(SERVER, USER_ID);
+    const result = await tryRefreshUpstreamTokens({
+      ...SERVER,
+      oauth_user_id: USER_ID,
+    });
     expect(result.status).toBe("no_refresh_token");
     expect(upsert).not.toHaveBeenCalled();
   });
@@ -232,8 +319,8 @@ describe("tryRefreshUpstreamTokens", () => {
     });
 
     const [a, b] = await Promise.all([
-      tryRefreshUpstreamTokens(SERVER, USER_ID),
-      tryRefreshUpstreamTokens(SERVER, USER_ID),
+      tryRefreshUpstreamTokens({ ...SERVER, oauth_user_id: USER_ID }),
+      tryRefreshUpstreamTokens({ ...SERVER, oauth_user_id: USER_ID }),
     ]);
 
     expect(a.status).toBe("refreshed");
@@ -278,8 +365,8 @@ describe("tryRefreshUpstreamTokens", () => {
       });
     });
 
-    await tryRefreshUpstreamTokens(SERVER, USER_ID);
-    await tryRefreshUpstreamTokens(SERVER, USER_ID);
+    await tryRefreshUpstreamTokens({ ...SERVER, oauth_user_id: USER_ID });
+    await tryRefreshUpstreamTokens({ ...SERVER, oauth_user_id: USER_ID });
     expect(postCount).toBe(2);
   });
 
@@ -310,13 +397,19 @@ describe("tryRefreshUpstreamTokens", () => {
       });
     });
 
-    const first = await tryRefreshUpstreamTokens(SERVER, USER_ID);
+    const first = await tryRefreshUpstreamTokens({
+      ...SERVER,
+      oauth_user_id: USER_ID,
+    });
     expect(first.status).toBe("failed");
     // If the mutex pinned, the second call would also resolve to first's
     // result. With the finally{} release it re-runs (and would in this
     // mock again return invalid_grant — what we assert is that the call
     // *executes* a fresh attempt rather than returning the prior promise).
-    const second = await tryRefreshUpstreamTokens(SERVER, USER_ID);
+    const second = await tryRefreshUpstreamTokens({
+      ...SERVER,
+      oauth_user_id: USER_ID,
+    });
     expect(second.status).toBe("failed");
   });
 
@@ -346,7 +439,10 @@ describe("tryRefreshUpstreamTokens", () => {
       });
     });
 
-    const result = await tryRefreshUpstreamTokens(SERVER, USER_ID);
+    const result = await tryRefreshUpstreamTokens({
+      ...SERVER,
+      oauth_user_id: USER_ID,
+    });
     expect(result.status).toBe("failed");
     expect(result.error).toBe("invalid_grant");
     expect(result.upstreamStatus).toBe(400);

@@ -464,14 +464,12 @@ export const oauthImplementations = {
       return { success: false as const, ...serverResolution.error };
     }
 
-    const result = await tryRefreshUpstreamTokens(
-      {
-        uuid: input.mcp_server_uuid,
-        name: "frontend-refresh",
-        url: serverResolution.url,
-      },
-      userId,
-    );
+    const result = await tryRefreshUpstreamTokens({
+      uuid: input.mcp_server_uuid,
+      name: "frontend-refresh",
+      url: serverResolution.url,
+      oauth_user_id: userId,
+    });
 
     switch (result.status) {
       case "refreshed":
