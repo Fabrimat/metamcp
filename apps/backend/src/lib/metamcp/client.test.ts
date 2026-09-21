@@ -581,4 +581,143 @@ describe("McpServerPool — OAuth principal cache identity", () => {
       await pool.cleanupAll();
     }
   });
+
+  it("discards an old connection whose creation began before administrative invalidation", async () => {
+    const oldCreationGate = deferred();
+    clientConnect.mockReset();
+    clientConnect
+      .mockImplementationOnce(() => oldCreationGate.promise)
+      .mockResolvedValue(undefined);
+    MockStreamableHTTPClientTransport.instances.length = 0;
+    const pool = makePool();
+    const oldParams = makeServer({
+      oauth_user_id: "user-a",
+      oauth_tokens: { access_token: "OLD_TOKEN", token_type: "Bearer" },
+      forward_headers: { authorization: "x-forwarded-authorization" },
+    });
+    const newParams = makeServer({
+      oauth_user_id: "user-a",
+      oauth_tokens: { access_token: "NEW_TOKEN", token_type: "Bearer" },
+      forward_headers: { authorization: "x-forwarded-authorization" },
+    });
+    let oldRequest: Promise<unknown> | undefined;
+
+    try {
+      oldRequest = pool.getSession(
+        "old-session",
+        oldParams.uuid,
+        oldParams,
+        "namespace-a",
+      );
+      await vi.waitFor(() => {
+        expect(clientConnect).toHaveBeenCalledTimes(1);
+      });
+      const oldTransport = MockStreamableHTTPClientTransport.instances[0] as
+        | (MockTransport & { close: () => Promise<void> })
+        | undefined;
+      expect(oldTransport).toBeDefined();
+      if (!oldTransport) {
+        throw new Error("expected the pending old transport");
+      }
+      const oldTransportCleanup = vi.spyOn(oldTransport, "close");
+
+      await pool.invalidateIdleSession(
+        oldParams.uuid,
+        newParams,
+        "namespace-a",
+      );
+      oldCreationGate.resolve();
+      const staleResult = await oldRequest;
+
+      expect(staleResult).toBeUndefined();
+      expect(oldTransportCleanup).toHaveBeenCalledTimes(1);
+      expect(
+        Object.values(pool.getSessionConnections("old-session") ?? {}),
+      ).toHaveLength(0);
+    } finally {
+      oldCreationGate.resolve();
+      await oldRequest?.catch(() => undefined);
+      await pool.cleanupAll();
+    }
+  });
+
+  it("serializes overlapping administrative invalidations and keeps acquisition blocked through the last update", async () => {
+    const firstUpdateGate = deferred();
+    const secondUpdateGate = deferred();
+    clientConnect.mockReset();
+    clientConnect
+      .mockImplementationOnce(() => firstUpdateGate.promise)
+      .mockImplementationOnce(() => secondUpdateGate.promise)
+      .mockResolvedValue(undefined);
+    MockStreamableHTTPClientTransport.instances.length = 0;
+    const pool = makePool();
+    const firstParams = makeServer({
+      oauth_user_id: "user-a",
+      oauth_tokens: { access_token: "TOKEN_1", token_type: "Bearer" },
+    });
+    const secondParams = makeServer({
+      oauth_user_id: "user-a",
+      oauth_tokens: { access_token: "TOKEN_2", token_type: "Bearer" },
+    });
+    const poolState = pool as unknown as {
+      serverParamsCache: Record<string, ServerParameters>;
+    };
+    let firstUpdate: Promise<void> | undefined;
+    let secondUpdate: Promise<void> | undefined;
+
+    try {
+      firstUpdate = pool.invalidateIdleSession(
+        firstParams.uuid,
+        firstParams,
+        "namespace-a",
+      );
+      await vi.waitFor(() => {
+        expect(clientConnect).toHaveBeenCalledTimes(1);
+      });
+
+      secondUpdate = pool.invalidateIdleSession(
+        secondParams.uuid,
+        secondParams,
+        "namespace-a",
+      );
+      // Give an incorrectly-concurrent second update enough time to reach its
+      // connection attempt; a serialized update remains queued behind gate 1.
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      const callsWhileSecondWasQueued = clientConnect.mock.calls.length;
+
+      firstUpdateGate.resolve();
+      await firstUpdate;
+      await vi.waitFor(() => {
+        expect(clientConnect.mock.calls.length).toBeGreaterThanOrEqual(2);
+      });
+
+      const blocked = await pool.getSession(
+        "between-updates",
+        firstParams.uuid,
+        firstParams,
+        "namespace-a",
+      );
+
+      secondUpdateGate.resolve();
+      await secondUpdate;
+
+      expect(callsWhileSecondWasQueued).toBe(1);
+      expect(blocked).toBeUndefined();
+      expect(Object.values(poolState.serverParamsCache)).toEqual([
+        secondParams,
+      ]);
+      expect(authHeaderOf(MockStreamableHTTPClientTransport.instances[1])).toBe(
+        "Bearer TOKEN_2",
+      );
+    } finally {
+      firstUpdateGate.resolve();
+      secondUpdateGate.resolve();
+      await Promise.allSettled(
+        [firstUpdate, secondUpdate].filter(
+          (update): update is Promise<void> => update !== undefined,
+        ),
+      );
+      await pool.cleanupAll();
+    }
+  });
 });

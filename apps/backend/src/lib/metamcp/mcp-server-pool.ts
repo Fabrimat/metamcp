@@ -64,9 +64,9 @@ export class McpServerPool {
   // stale generation knows to discard its result instead of storing it.
   private idleSessionGenerations: Record<string, number> = {};
 
-  // Blocks runtime acquisition while an administrative update atomically swaps
-  // every principal-scoped connection generation for a server.
-  private administrativelyInvalidatingServers: Set<string> = new Set();
+  // Per-server promise tails serialize administrative updates. Presence in the
+  // map also blocks runtime acquisition until the final queued update finishes.
+  private administrativeInvalidations: Map<string, Promise<void>> = new Map();
 
   // Session cleanup timer
   private cleanupTimer: NodeJS.Timeout | null = null;
@@ -215,7 +215,7 @@ export class McpServerPool {
     params: ServerParameters,
     namespaceUuid?: string,
   ): Promise<ConnectedClient | undefined> {
-    if (this.administrativelyInvalidatingServers.has(serverUuid)) {
+    if (this.administrativeInvalidations.has(serverUuid)) {
       logger.warn(
         `Server ${serverUuid} is being administratively invalidated; deferring connection acquisition`,
       );
@@ -279,8 +279,24 @@ export class McpServerPool {
       return undefined;
     }
 
+    const generation = this.idleSessionGenerations[cacheKey] ?? 0;
     const newClient = await this.createNewConnection(params, namespaceUuid);
     if (!newClient) {
+      return undefined;
+    }
+
+    if (
+      this.administrativeInvalidations.has(serverUuid) ||
+      (this.idleSessionGenerations[cacheKey] ?? 0) !== generation
+    ) {
+      try {
+        await newClient.cleanup();
+      } catch (error) {
+        logger.error(
+          `Error cleaning up stale connection for server ${params.uuid}:`,
+          error,
+        );
+      }
       return undefined;
     }
 
@@ -839,62 +855,71 @@ export class McpServerPool {
     params: ServerParameters,
     namespaceUuid?: string,
   ): Promise<void> {
-    logger.info(`Invalidating idle session for server ${serverUuid}`);
-    this.administrativelyInvalidatingServers.add(serverUuid);
+    const previous =
+      this.administrativeInvalidations.get(serverUuid) ?? Promise.resolve();
+    const operation = previous
+      .catch(() => undefined)
+      .then(async () => {
+        logger.info(`Invalidating idle session for server ${serverUuid}`);
+        // Everything through the end of this block is synchronous. Detach all
+        // old active/idle/cache/pending state before any cleanup can yield and
+        // let a concurrent getSession observe the old generation.
+        const existingKeys = this.getKnownConnectionKeysForServer(serverUuid);
+        const clientsToCleanup = new Set<ConnectedClient>();
 
-    try {
-      // Everything through the end of this block is synchronous. Detach all
-      // old active/idle/cache/pending state before any cleanup can yield and
-      // let a concurrent getSession observe the old generation.
-      const existingKeys = this.getKnownConnectionKeysForServer(serverUuid);
-      const clientsToCleanup = new Set<ConnectedClient>();
+        for (const [sessionId, sessionServers] of Object.entries(
+          this.activeSessions,
+        )) {
+          for (const [existingKey, client] of Object.entries(sessionServers)) {
+            if (!connectionKeyBelongsToServer(existingKey, serverUuid)) {
+              continue;
+            }
+            clientsToCleanup.add(client);
+            delete sessionServers[existingKey];
+            this.sessionToServers[sessionId]?.delete(existingKey);
+          }
+        }
 
-      for (const [sessionId, sessionServers] of Object.entries(
-        this.activeSessions,
-      )) {
-        for (const [existingKey, client] of Object.entries(sessionServers)) {
+        for (const [existingKey, client] of Object.entries(this.idleSessions)) {
           if (!connectionKeyBelongsToServer(existingKey, serverUuid)) {
             continue;
           }
           clientsToCleanup.add(client);
-          delete sessionServers[existingKey];
-          this.sessionToServers[sessionId]?.delete(existingKey);
+          delete this.idleSessions[existingKey];
         }
-      }
 
-      for (const [existingKey, client] of Object.entries(this.idleSessions)) {
-        if (!connectionKeyBelongsToServer(existingKey, serverUuid)) {
-          continue;
+        for (const existingKey of existingKeys) {
+          delete this.serverParamsCache[existingKey];
+          this.idleSessionGenerations[existingKey] =
+            (this.idleSessionGenerations[existingKey] ?? 0) + 1;
+          this.creatingIdleSessions.delete(existingKey);
         }
-        clientsToCleanup.add(client);
-        delete this.idleSessions[existingKey];
-      }
 
-      for (const existingKey of existingKeys) {
-        delete this.serverParamsCache[existingKey];
-        this.idleSessionGenerations[existingKey] =
-          (this.idleSessionGenerations[existingKey] ?? 0) + 1;
-        this.creatingIdleSessions.delete(existingKey);
-      }
+        await Promise.all(
+          [...clientsToCleanup].map(async (client) => {
+            try {
+              await client.cleanup();
+            } catch (error) {
+              logger.error(
+                `Error cleaning up connection during administrative update for ${serverUuid}:`,
+                error,
+              );
+            }
+          }),
+        );
 
-      await Promise.all(
-        [...clientsToCleanup].map(async (client) => {
-          try {
-            await client.cleanup();
-          } catch (error) {
-            logger.error(
-              `Error cleaning up connection during administrative update for ${serverUuid}:`,
-              error,
-            );
-          }
-        }),
-      );
+        const cacheKey = connectionKey(serverUuid, params.oauth_user_id);
+        this.serverParamsCache[cacheKey] = params;
+        await this.createIdleSession(serverUuid, params, namespaceUuid);
+      });
+    this.administrativeInvalidations.set(serverUuid, operation);
 
-      const cacheKey = connectionKey(serverUuid, params.oauth_user_id);
-      this.serverParamsCache[cacheKey] = params;
-      await this.createIdleSession(serverUuid, params, namespaceUuid);
+    try {
+      await operation;
     } finally {
-      this.administrativelyInvalidatingServers.delete(serverUuid);
+      if (this.administrativeInvalidations.get(serverUuid) === operation) {
+        this.administrativeInvalidations.delete(serverUuid);
+      }
     }
   }
 
