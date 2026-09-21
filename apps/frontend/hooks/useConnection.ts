@@ -37,6 +37,8 @@ import { toast } from "sonner";
 import type * as z3 from "zod/v3";
 import type * as z4 from "zod/v4/core";
 
+import { SESSION_KEYS } from "@/lib/constants";
+
 import { ConnectionStatus } from "../lib/constants";
 import { getAppUrl } from "../lib/env";
 import {
@@ -339,10 +341,23 @@ export function useConnection({
     }
 
     if (is401 && isMetaMCP) {
-      const result = await auth(authProvider, {
-        serverUrl: url || "",
-      });
-      return result === "AUTHORIZED";
+      sessionStorage.setItem(SESSION_KEYS.SERVER_URL, url || "");
+      sessionStorage.setItem(SESSION_KEYS.MCP_SERVER_UUID, mcpServerUuid);
+      try {
+        const result = await auth(authProvider, {
+          serverUrl: url || "",
+        });
+        if (result === "AUTHORIZED") {
+          sessionStorage.removeItem(SESSION_KEYS.SERVER_URL);
+          sessionStorage.removeItem(SESSION_KEYS.MCP_SERVER_UUID);
+          return true;
+        }
+        return false;
+      } catch (authError) {
+        sessionStorage.removeItem(SESSION_KEYS.SERVER_URL);
+        sessionStorage.removeItem(SESSION_KEYS.MCP_SERVER_UUID);
+        throw authError;
+      }
     }
     return false;
   });

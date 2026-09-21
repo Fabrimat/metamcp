@@ -29,6 +29,9 @@
   "oauthTokenEndpoint": {
     "invalid": "Token endpoint must be a valid URL"
   },
+  "oauthRedirectUri": {
+    "invalid": "Redirect URI must be a loopback URL: scheme http with host 127.0.0.1, localhost, or [::1] (any port/path allowed), no fragment"
+  },
   "namespaceName": {
     "required": "Namespace name is required",
     "invalidCharacters": "Namespace name must only contain letters, numbers, underscores, and hyphens"
@@ -57,7 +60,7 @@
     "tooShort": "Too short",
     "tooLong": "Too long"
   },
-  "maxRateSeconds":{
+  "maxRateSeconds": {
     "required": "Max rate seconds is required",
     "tooSmall": "Max rate must be greater than 0",
     "tooLarge": "Max rate must be less than 1000000"
@@ -67,7 +70,7 @@
     "tooSmall": "Max rate must be greater than 0",
     "tooLarge": "Max rate must be less than 1000000"
   },
-  "clientMaxRateSeconds":{
+  "clientMaxRateSeconds": {
     "required": "Max rate seconds is required",
     "tooSmall": "Max rate must be greater than 0",
     "tooLarge": "Max rate must be less than 1000000"

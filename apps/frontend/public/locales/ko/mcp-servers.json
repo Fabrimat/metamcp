@@ -161,6 +161,8 @@
     "backToServers": "MCP Server로 돌아가기",
     "editServer": "Server 편집",
     "deleteServer": "Server 삭제",
+    "deleteServerSuccess": "MCP Server가 삭제되었습니다",
+    "deleteServerError": "MCP Server를 삭제하지 못했습니다",
     "deleteConfirmTitle": "MCP Server 삭제",
     "deleteConfirmDescription": "\"{{name}}\"을(를) 삭제하시겠습니까? 이 작업은 취소할 수 없습니다.",
     "deleting": "삭제 중...",

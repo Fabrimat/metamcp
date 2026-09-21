@@ -155,6 +155,8 @@
     "backToServers": "Volver a MCP Servers",
     "editServer": "Editar Server",
     "deleteServer": "Eliminar Server",
+    "deleteServerSuccess": "Servidor MCP eliminado correctamente",
+    "deleteServerError": "No se pudo eliminar el servidor MCP",
     "deleteConfirmTitle": "Eliminar MCP Server",
     "deleteConfirmDescription": "¿Está seguro de que desea eliminar \"{{name}}?\" Esta acción no se puede deshacer.",
     "deleting": "Eliminando...",

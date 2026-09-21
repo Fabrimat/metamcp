@@ -1,12 +1,14 @@
 "use client";
 
+import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
 import { useTranslations } from "@/hooks/useTranslations";
 
 import { getAppUrl } from "../lib/env";
-import { parseOAuthCallback } from "../lib/oauth-callback";
+import { completeOAuthCallback } from "../lib/oauth-callback";
+import { createAuthProvider } from "../lib/oauth-provider";
 import { vanillaTrpcClient } from "../lib/trpc";
 
 type CallbackStatus =
@@ -44,41 +46,30 @@ const OAuthCallback = () => {
         return;
       }
 
-      const callback = parseOAuthCallback(window.location.search);
-      if (callback.kind === "error") {
+      const completion = await completeOAuthCallback(window.location.search, {
+        storage: sessionStorage,
+        exchangeUpstream: (input) =>
+          vanillaTrpcClient.frontend.oauth.exchangeToken.mutate(input),
+        completeDownstream: async ({
+          authorizationCode,
+          returnUuid,
+          serverUrl,
+        }) => {
+          const provider = createAuthProvider(returnUuid, serverUrl);
+          const result = await auth(provider, {
+            serverUrl,
+            authorizationCode,
+          });
+          return { result, tokens: await provider.tokens() };
+        },
+        navigate: (path) => window.location.assign(path),
+      });
+
+      if (completion.kind === "error") {
         setStatus({
           kind: "error",
-          error: callback.error,
-          description: callback.errorDescription,
-        });
-        return;
-      }
-
-      try {
-        const result =
-          await vanillaTrpcClient.frontend.oauth.exchangeToken.mutate({
-            code: callback.code,
-            state: callback.state,
-          });
-
-        if (!result.success) {
-          setStatus({
-            kind: "error",
-            error: result.error,
-            description: result.error_description,
-          });
-          return;
-        }
-
-        window.location.assign(`/mcp-servers/${result.data.mcp_server_uuid}`);
-      } catch (error) {
-        setStatus({
-          kind: "error",
-          error: "callback_failed",
-          description:
-            error instanceof Error
-              ? error.message
-              : "Unexpected error during OAuth callback.",
+          error: completion.error,
+          description: completion.errorDescription,
         });
       }
     };
