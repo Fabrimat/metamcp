@@ -116,6 +116,15 @@ function makeServer(
   };
 }
 
+function makePool(maxConnectionsPerServer = 5): McpServerPool {
+  const PoolConstructor = McpServerPool as unknown as new (
+    defaultIdleCount: number,
+    maxTotalConnections: number,
+    maxConnectionsPerServer: number,
+  ) => McpServerPool;
+  return new PoolConstructor(0, 100, maxConnectionsPerServer);
+}
+
 describe("refreshIfExpiringSoon", () => {
   beforeEach(() => {
     tryRefreshUpstreamTokens.mockReset();
@@ -333,11 +342,50 @@ describe("connectMetaMcpClient — reactive 401-refresh cascade", () => {
 });
 
 describe("McpServerPool — OAuth principal cache identity", () => {
+  it("does not exceed the per-server cap when existing connections belong to another principal", async () => {
+    clientConnect.mockReset();
+    clientConnect.mockResolvedValue(undefined);
+    MockStreamableHTTPClientTransport.instances.length = 0;
+    const pool = makePool(1);
+    const userA = makeServer({
+      oauth_user_id: "user-a",
+      oauth_tokens: { access_token: "TOKEN_A", token_type: "Bearer" },
+      forward_headers: { authorization: "x-forwarded-authorization" },
+    });
+    const userB = makeServer({
+      oauth_user_id: "user-b",
+      oauth_tokens: { access_token: "TOKEN_B", token_type: "Bearer" },
+      forward_headers: { authorization: "x-forwarded-authorization" },
+    });
+
+    try {
+      const first = await pool.getSession(
+        "session-a",
+        userA.uuid,
+        userA,
+        "namespace-a",
+      );
+      const blocked = await pool.getSession(
+        "session-b",
+        userB.uuid,
+        userB,
+        "namespace-b",
+      );
+
+      expect(first).toBeDefined();
+      expect(blocked).toBeUndefined();
+      expect(clientConnect).toHaveBeenCalledTimes(1);
+      expect(MockStreamableHTTPClientTransport.instances).toHaveLength(1);
+    } finally {
+      await pool.cleanupAll();
+    }
+  });
+
   it("does not reuse a connection for another principal sharing the same session and server UUID", async () => {
     clientConnect.mockReset();
     clientConnect.mockResolvedValue(undefined);
     MockStreamableHTTPClientTransport.instances.length = 0;
-    const pool = McpServerPool.getInstance(0, 5);
+    const pool = makePool();
     const userA = makeServer({
       oauth_user_id: "user-a",
       oauth_tokens: { access_token: "TOKEN_A", token_type: "Bearer" },
@@ -373,6 +421,69 @@ describe("McpServerPool — OAuth principal cache identity", () => {
       expect(authHeaderOf(MockStreamableHTTPClientTransport.instances[1])).toBe(
         "Bearer TOKEN_B",
       );
+    } finally {
+      await pool.cleanupAll();
+    }
+  });
+
+  it("administrative invalidation cleans active connections for every principal", async () => {
+    clientConnect.mockReset();
+    clientConnect.mockResolvedValue(undefined);
+    MockStreamableHTTPClientTransport.instances.length = 0;
+    const pool = makePool();
+    const userA = makeServer({
+      oauth_user_id: "user-a",
+      oauth_tokens: { access_token: "TOKEN_A", token_type: "Bearer" },
+      forward_headers: { authorization: "x-forwarded-authorization" },
+    });
+    const userB = makeServer({
+      oauth_user_id: "user-b",
+      oauth_tokens: { access_token: "TOKEN_B", token_type: "Bearer" },
+      forward_headers: { authorization: "x-forwarded-authorization" },
+    });
+
+    try {
+      const firstA = await pool.getSession(
+        "session-a",
+        userA.uuid,
+        userA,
+        "namespace-a",
+      );
+      const firstB = await pool.getSession(
+        "session-b",
+        userB.uuid,
+        userB,
+        "namespace-b",
+      );
+      expect(firstA).toBeDefined();
+      expect(firstB).toBeDefined();
+      if (!firstA || !firstB) {
+        throw new Error("expected both principal-scoped connections");
+      }
+      const cleanupA = vi.spyOn(firstA, "cleanup");
+      const cleanupB = vi.spyOn(firstB, "cleanup");
+
+      await pool.invalidateIdleSession(userA.uuid, userA, "namespace-a");
+
+      expect(cleanupA).toHaveBeenCalledTimes(1);
+      expect(cleanupB).toHaveBeenCalledTimes(1);
+
+      const nextA = await pool.getSession(
+        "session-a",
+        userA.uuid,
+        userA,
+        "namespace-a",
+      );
+      const nextB = await pool.getSession(
+        "session-b",
+        userB.uuid,
+        userB,
+        "namespace-b",
+      );
+      expect(nextA).toBeDefined();
+      expect(nextB).toBeDefined();
+      expect(nextA).not.toBe(firstA);
+      expect(nextB).not.toBe(firstB);
     } finally {
       await pool.cleanupAll();
     }

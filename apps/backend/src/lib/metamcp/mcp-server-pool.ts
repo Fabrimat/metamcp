@@ -263,6 +263,10 @@ export class McpServerPool {
         this.sessionToServers[sessionId].add(cacheKey);
         return reusable;
       }
+      logger.warn(
+        `Per-server connection limit reached for ${serverUuid}, but no connection exists for the requested OAuth principal`,
+      );
+      return undefined;
     }
 
     const newClient = await this.createNewConnection(params, namespaceUuid);
@@ -826,6 +830,35 @@ export class McpServerPool {
     namespaceUuid?: string,
   ): Promise<void> {
     logger.info(`Invalidating idle session for server ${serverUuid}`);
+
+    // An administrative server update changes connection parameters for every
+    // principal. This is deliberately separate from recovery invalidation so
+    // its cleanup and logging retain administrative semantics.
+    const activeClients = new Set<ConnectedClient>();
+    for (const [sessionId, sessionServers] of Object.entries(
+      this.activeSessions,
+    )) {
+      for (const [existingKey, client] of Object.entries(sessionServers)) {
+        if (!connectionKeyBelongsToServer(existingKey, serverUuid)) {
+          continue;
+        }
+        activeClients.add(client);
+        delete sessionServers[existingKey];
+        this.sessionToServers[sessionId]?.delete(existingKey);
+      }
+    }
+    await Promise.all(
+      [...activeClients].map(async (client) => {
+        try {
+          await client.cleanup();
+        } catch (error) {
+          logger.error(
+            `Error cleaning up active connection during administrative update for ${serverUuid}:`,
+            error,
+          );
+        }
+      }),
+    );
 
     const cacheKey = connectionKey(serverUuid, params.oauth_user_id);
 
