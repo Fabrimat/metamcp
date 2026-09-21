@@ -20,6 +20,18 @@
     "required": "SSE 和 Streamable HTTP 类型需要 URL",
     "invalidUrl": "SSE 和 Streamable HTTP 类型的 URL 必须有效"
   },
+  "oauthClientId": {
+    "required": "设置任何预注册 OAuth 字段时都必须提供客户端 ID"
+  },
+  "oauthAuthorizationEndpoint": {
+    "invalid": "授权端点必须是有效 URL"
+  },
+  "oauthTokenEndpoint": {
+    "invalid": "令牌端点必须是有效 URL"
+  },
+  "oauthRedirectUri": {
+    "invalid": "重定向 URI 必须是回环 URL：使用 http 方案，主机为 127.0.0.1、localhost 或 [::1]，且不含片段"
+  },
   "namespaceName": {
     "required": "命名空间名称为必填项",
     "invalidCharacters": "命名空间名称只能包含字母、数字、下划线和连字符"

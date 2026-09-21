@@ -35,6 +35,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { useConnection } from "@/hooks/useConnection";
 import { useTranslations } from "@/hooks/useTranslations";
+import { beginUpstreamAuthorization } from "@/lib/oauth-authorization";
 import { trpc } from "@/lib/trpc";
 
 import { ToolManagement } from "./components/tool-management";
@@ -138,6 +139,29 @@ export default function McpServerDetailPage({
   const server: McpServer | undefined = serverResponse?.success
     ? serverResponse.data
     : undefined;
+
+  // Server-side authorize-URL construction (see
+  // apps/backend/src/trpc/oauth.impl.ts startAuthorization). This is the
+  // only way to start an OAuth flow against an upstream that returns a
+  // bare 403 with no WWW-Authenticate header (e.g. Reclaim.ai): the
+  // useConnection hook's handleAuthError only fires on a classified 401,
+  // so those upstreams never reach the auto-triggered flow.
+  const startAuthorizationMutation =
+    trpc.frontend.oauth.startAuthorization.useMutation();
+
+  const handleAuthorize = async () => {
+    try {
+      await beginUpstreamAuthorization(
+        uuid,
+        (input) => startAuthorizationMutation.mutateAsync(input),
+        (authorizationUrl) => window.location.assign(authorizationUrl),
+      );
+    } catch (error) {
+      toast.error(t("mcp-servers:detail.authorizeFailed"), {
+        description: error instanceof Error ? error.message : undefined,
+      });
+    }
+  };
 
   // MCP Connection setup - only enable when server data is loaded and not in error state
   const connection = useConnection({
@@ -461,6 +485,26 @@ export default function McpServerDetailPage({
                     ? t("mcp-servers:detail.reconnect")
                     : t("mcp-servers:detail.connect")}
                 </Button>
+                {(server.type === McpServerTypeEnum.enum.SSE ||
+                  server.type === McpServerTypeEnum.enum.STREAMABLE_HTTP) && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void handleAuthorize()}
+                    // Disabled while in flight: a second click before the
+                    // first authorize request resolves would run a second
+                    // dynamic client registration, overwriting the first
+                    // one's client_id and stranding the in-flight
+                    // authorization code (it would fail invalid_grant
+                    // against the now-superseded client).
+                    disabled={startAuthorizationMutation.isPending}
+                    className="whitespace-nowrap flex-shrink-0"
+                  >
+                    {startAuthorizationMutation.isPending
+                      ? t("mcp-servers:detail.authorizing")
+                      : t("mcp-servers:detail.authorize")}
+                  </Button>
+                )}
               </div>
             )}
           </div>

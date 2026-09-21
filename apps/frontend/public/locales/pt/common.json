@@ -67,7 +67,9 @@
   "oauth": {
     "processingCallback": "Processando callback OAuth...",
     "authorizationInProgress": "Autorização em andamento...",
-    "redirecting": "Redirecionando..."
+    "redirecting": "Redirecionando...",
+    "callbackFailedTitle": "Falha na autorização OAuth",
+    "backToMcpServers": "Voltar aos servidores MCP"
   },
   "pagination": {
     "previous": "Anterior",

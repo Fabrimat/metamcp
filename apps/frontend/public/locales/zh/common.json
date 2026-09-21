@@ -67,7 +67,9 @@
   "oauth": {
     "processingCallback": "正在处理 OAuth 回调...",
     "authorizationInProgress": "授权进行中...",
-    "redirecting": "重定向中..."
+    "redirecting": "重定向中...",
+    "callbackFailedTitle": "OAuth 授权失败",
+    "backToMcpServers": "返回 MCP 服务器"
   },
   "pagination": {
     "previous": "上一页",

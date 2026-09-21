@@ -20,6 +20,18 @@
     "required": "SSE 및 Streamable HTTP 유형에는 URL이 필요합니다",
     "invalidUrl": "SSE 및 Streamable HTTP 유형에는 유효한 URL을 입력해야 합니다"
   },
+  "oauthClientId": {
+    "required": "사전 등록된 OAuth 필드를 설정하면 클라이언트 ID가 필요합니다"
+  },
+  "oauthAuthorizationEndpoint": {
+    "invalid": "인증 엔드포인트는 유효한 URL이어야 합니다"
+  },
+  "oauthTokenEndpoint": {
+    "invalid": "토큰 엔드포인트는 유효한 URL이어야 합니다"
+  },
+  "oauthRedirectUri": {
+    "invalid": "리디렉션 URI는 http 스킴과 127.0.0.1, localhost 또는 [::1] 호스트를 사용하고 프래그먼트가 없는 루프백 URL이어야 합니다"
+  },
   "namespaceName": {
     "required": "Namespace 이름을 입력하세요",
     "invalidCharacters": "Namespace 이름은 문자, 숫자, 밑줄, 하이픈만 포함할 수 있습니다"

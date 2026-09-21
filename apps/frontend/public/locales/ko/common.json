@@ -67,7 +67,9 @@
   "oauth": {
     "processingCallback": "OAuth 콜백 처리 중...",
     "authorizationInProgress": "인증 진행 중...",
-    "redirecting": "리디렉션 중..."
+    "redirecting": "리디렉션 중...",
+    "callbackFailedTitle": "OAuth 인증 실패",
+    "backToMcpServers": "MCP 서버로 돌아가기"
   },
   "pagination": {
     "previous": "이전",

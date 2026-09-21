@@ -5,36 +5,13 @@ import { useEffect, useRef, useState } from "react";
 
 import { useTranslations } from "@/hooks/useTranslations";
 
-import { getServerSpecificKey, SESSION_KEYS } from "../lib/constants";
+import { getAppUrl } from "../lib/env";
+import { parseOAuthCallback } from "../lib/oauth-callback";
 import { vanillaTrpcClient } from "../lib/trpc";
 
 type CallbackStatus =
   | { kind: "pending" }
   | { kind: "error"; error: string; description?: string };
-
-// Drop every sessionStorage entry the SDK used during the pre-redirect half
-// of the flow. Called from both the success and the error paths so a
-// failed exchange leaves no stale state to confuse a retry — the next
-// authorize click starts fresh.
-//
-// `serverUrl` is only known after we read sessionStorage; when it's null
-// (e.g. the upstream-error or missing-parameters early returns) we can
-// still clear the unscoped keys.
-function clearOAuthSessionKeys(serverUrl: string | null): void {
-  if (serverUrl) {
-    sessionStorage.removeItem(
-      getServerSpecificKey(SESSION_KEYS.CLIENT_INFORMATION, serverUrl),
-    );
-    sessionStorage.removeItem(
-      getServerSpecificKey(SESSION_KEYS.TOKENS, serverUrl),
-    );
-    sessionStorage.removeItem(
-      getServerSpecificKey(SESSION_KEYS.CODE_VERIFIER, serverUrl),
-    );
-  }
-  sessionStorage.removeItem(SESSION_KEYS.SERVER_URL);
-  sessionStorage.removeItem(SESSION_KEYS.MCP_SERVER_UUID);
-}
 
 const OAuthCallback = () => {
   const { t } = useTranslations();
@@ -49,61 +26,42 @@ const OAuthCallback = () => {
       }
       hasProcessedRef.current = true;
 
-      const params = new URLSearchParams(window.location.search);
-      const code = params.get("code");
-      const state = params.get("state") ?? undefined;
-      const upstreamError = params.get("error");
-      const upstreamErrorDescription =
-        params.get("error_description") ?? undefined;
-      const serverUrl = sessionStorage.getItem(SESSION_KEYS.SERVER_URL);
-      const mcpServerUuid = sessionStorage.getItem(
-        SESSION_KEYS.MCP_SERVER_UUID,
-      );
-
-      // Upstream sent back an OAuth error response (user denied, invalid
-      // scope, ...). Surface it instead of pretending the flow succeeded.
-      if (upstreamError) {
-        clearOAuthSessionKeys(serverUrl);
-        setStatus({
-          kind: "error",
-          error: upstreamError,
-          description: upstreamErrorDescription,
-        });
+      // A loopback redirect_uri override (see mcp-servers.zod.ts
+      // isValidLoopbackRedirectUri) points the upstream back at
+      // http://127.0.0.1:<port> / http://localhost:<port>. When the user
+      // reaches MetaMCP itself through an SSH tunnel bound to that same
+      // loopback port, the upstream's redirect lands on the *tunnel*
+      // origin — which serves this same app — instead of MetaMCP's own
+      // configured origin (getAppUrl()). Bounce to the configured origin so
+      // the exchangeToken call runs against the configured application
+      // origin. The complete query string carries all callback inputs.
+      // Guarded on an actual origin mismatch so this can't loop.
+      const configuredOrigin = new URL(getAppUrl()).origin;
+      if (window.location.origin !== configuredOrigin) {
+        window.location.replace(
+          configuredOrigin + "/fe-oauth/callback" + window.location.search,
+        );
         return;
       }
 
-      if (!code || !serverUrl || !mcpServerUuid) {
-        clearOAuthSessionKeys(serverUrl);
+      const callback = parseOAuthCallback(window.location.search);
+      if (callback.kind === "error") {
         setStatus({
           kind: "error",
-          error: "missing_callback_parameters",
-          description:
-            "The OAuth callback URL is missing `code`, or the browser session lost track of which MCP server initiated the flow. Please re-trigger the authorize button.",
+          error: callback.error,
+          description: callback.errorDescription,
         });
         return;
       }
 
       try {
-        // The browser-side SDK already ran discovery, registration (if
-        // needed), `saveCodeVerifier`, and the redirect to the upstream's
-        // authorize endpoint. The remaining step — POSTing the code to the
-        // upstream's token endpoint — moves to the backend because most
-        // enterprise providers (Salesforce, Okta, Auth0, ...) do not
-        // expose CORS-permissive token endpoints.
-        // Note: we deliberately do NOT pass serverUrl to the backend. The
-        // backend looks up the upstream URL from `mcp_servers` keyed by
-        // uuid; accepting it from the browser would let any authenticated
-        // user steer the server-side token POST at an attacker-controlled
-        // host (SSRF / authorization-code exfiltration).
         const result =
           await vanillaTrpcClient.frontend.oauth.exchangeToken.mutate({
-            mcp_server_uuid: mcpServerUuid,
-            code,
-            state,
+            code: callback.code,
+            state: callback.state,
           });
 
         if (!result.success) {
-          clearOAuthSessionKeys(serverUrl);
           setStatus({
             kind: "error",
             error: result.error,
@@ -112,14 +70,8 @@ const OAuthCallback = () => {
           return;
         }
 
-        // Backend persisted tokens directly into oauth_sessions; we no
-        // longer need to mirror anything from sessionStorage.
-        clearOAuthSessionKeys(serverUrl);
-
-        window.location.href = `/mcp-servers/${mcpServerUuid}`;
+        window.location.assign(`/mcp-servers/${result.data.mcp_server_uuid}`);
       } catch (error) {
-        console.error("OAuth callback error:", error);
-        clearOAuthSessionKeys(serverUrl);
         setStatus({
           kind: "error",
           error: "callback_failed",

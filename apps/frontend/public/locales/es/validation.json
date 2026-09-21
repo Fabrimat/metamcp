@@ -20,6 +20,18 @@
     "required": "La URL es obligatoria para tipos SSE y Streamable HTTP",
     "invalidUrl": "La URL debe ser válida para tipos SSE y Streamable HTTP"
   },
+  "oauthClientId": {
+    "required": "El ID de cliente es obligatorio cuando se configura cualquier campo OAuth pre-registrado"
+  },
+  "oauthAuthorizationEndpoint": {
+    "invalid": "El endpoint de autorización debe ser una URL válida"
+  },
+  "oauthTokenEndpoint": {
+    "invalid": "El endpoint de token debe ser una URL válida"
+  },
+  "oauthRedirectUri": {
+    "invalid": "El URI de redirección debe ser una URL loopback: esquema http con host 127.0.0.1, localhost o [::1], y sin fragmento"
+  },
   "namespaceName": {
     "required": "El nombre del namespace es obligatorio",
     "invalidCharacters": "El nombre del namespace solo debe contener letras, números, guiones bajos y guiones"

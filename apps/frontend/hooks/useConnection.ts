@@ -24,22 +24,18 @@ import {
   Progress,
   PromptListChangedNotificationSchema,
   PromptReference,
-  Request,
   ResourceListChangedNotificationSchema,
   ResourceReference,
   ResourceUpdatedNotificationSchema,
-  Result,
   ServerCapabilities,
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { McpServerType, McpServerTypeEnum } from "@repo/zod-types";
 import { useMemoizedFn } from "ahooks";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import type * as z3 from "zod/v3";
 import type * as z4 from "zod/v4/core";
-
-import { SESSION_KEYS } from "@/lib/constants";
 
 import { ConnectionStatus } from "../lib/constants";
 import { getAppUrl } from "../lib/env";
@@ -47,6 +43,10 @@ import {
   Notification,
   StdErrNotificationSchema,
 } from "../lib/notificationTypes";
+import {
+  beginUpstreamAuthorization,
+  shouldStartUpstreamOAuth,
+} from "../lib/oauth-authorization";
 import { createAuthProvider } from "../lib/oauth-provider";
 import { trpc } from "../lib/trpc";
 
@@ -74,6 +74,9 @@ interface UseConnectionOptions {
   env: Record<string, string>;
   bearerToken?: string;
   headerName?: string;
+  // Retained for callers that also edit the server-side redirect override.
+  // Upstream authorization reads the persisted value on the backend.
+  redirectUri?: string | null;
   onNotification?: (notification: Notification) => void;
   onStdErrNotification?: (notification: Notification) => void;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -103,6 +106,9 @@ export function useConnection({
   enabled = true,
 }: UseConnectionOptions) {
   const authProvider = createAuthProvider(mcpServerUuid, url);
+  const startAuthorization =
+    trpc.frontend.oauth.startAuthorization.useMutation();
+  const upstreamAuthorizationInFlightRef = useRef(false);
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("disconnected");
   const [serverCapabilities, setServerCapabilities] =
@@ -312,10 +318,27 @@ export function useConnection({
   });
 
   const handleAuthError = useMemoizedFn(async (error: unknown) => {
-    if (is401Error(error)) {
-      sessionStorage.setItem(SESSION_KEYS.SERVER_URL, url || "");
-      sessionStorage.setItem(SESSION_KEYS.MCP_SERVER_UUID, mcpServerUuid);
+    const is401 = is401Error(error);
+    if (shouldStartUpstreamOAuth({ is401, isMetaMCP })) {
+      if (upstreamAuthorizationInFlightRef.current) {
+        return false;
+      }
 
+      upstreamAuthorizationInFlightRef.current = true;
+      try {
+        await beginUpstreamAuthorization(
+          mcpServerUuid,
+          (input) => startAuthorization.mutateAsync(input),
+          (authorizationUrl) => window.location.assign(authorizationUrl),
+        );
+      } catch (authorizationError) {
+        upstreamAuthorizationInFlightRef.current = false;
+        throw authorizationError;
+      }
+      return false;
+    }
+
+    if (is401 && isMetaMCP) {
       const result = await auth(authProvider, {
         serverUrl: url || "",
       });
@@ -374,7 +397,8 @@ export function useConnection({
 
         // Use manually provided bearer token if available, otherwise use OAuth tokens
         const token =
-          bearerToken || (await authProvider.tokens())?.access_token;
+          bearerToken ||
+          (isMetaMCP ? (await authProvider.tokens())?.access_token : undefined);
         if (token) {
           const authHeaderName = headerName || "Authorization";
 
@@ -433,7 +457,6 @@ export function useConnection({
               mcpProxyServerUrl.searchParams.append("args", args);
               mcpProxyServerUrl.searchParams.append("env", JSON.stringify(env));
               transportOptions = {
-                authProvider: authProvider,
                 eventSourceInit: {
                   fetch: (
                     url: string | URL | globalThis.Request,
@@ -492,7 +515,6 @@ export function useConnection({
               mcpProxyServerUrl = new URL(`/mcp-proxy/server/mcp`, getAppUrl());
               mcpProxyServerUrl.searchParams.append("url", url);
               transportOptions = {
-                authProvider: authProvider,
                 eventSourceInit: {
                   fetch: (
                     url: string | URL | globalThis.Request,
@@ -643,8 +665,9 @@ export function useConnection({
       if (mcpClient) {
         await mcpClient.close();
       }
-      if (enabled) {
-        // Only clear auth provider if hook is enabled (to avoid clearing when just disabled)
+      if (enabled && isMetaMCP) {
+        // Browser-held OAuth state belongs only to the namespace/downstream
+        // compatibility path. Upstream sessions are backend-owned.
         authProvider.clear();
       }
     } catch (error) {
