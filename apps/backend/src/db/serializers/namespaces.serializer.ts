@@ -50,6 +50,7 @@ export class NamespacesSerializer {
         error_status: server.error_status,
         created_at: server.created_at.toISOString(),
         user_id: server.user_id,
+        redirect_uri: server.redirect_uri,
         status: server.status,
       })),
     };

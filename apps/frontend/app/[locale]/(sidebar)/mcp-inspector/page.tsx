@@ -96,6 +96,7 @@ function McpInspectorContent() {
     url: selectedServer?.url || "",
     env: selectedServer?.env || {},
     bearerToken: selectedServer?.bearerToken || undefined,
+    redirectUri: selectedServer?.redirect_uri,
     onNotification,
     onStdErrNotification,
     enabled: Boolean(selectedServer && !serversLoading && selectedServerUuid),

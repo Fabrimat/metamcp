@@ -167,6 +167,7 @@ export function EditMcpServer({
       oauth_token_endpoint: "",
       oauth_scope: "",
       oauth_token_endpoint_auth_method: "none",
+      oauth_redirect_uri: "",
     },
   });
 
@@ -197,6 +198,7 @@ export function EditMcpServer({
           editForm.setValue("oauth_token_endpoint", "");
           editForm.setValue("oauth_scope", "");
           editForm.setValue("oauth_token_endpoint_auth_method", "none");
+          editForm.setValue("oauth_redirect_uri", "");
         } else if (
           value.type === McpServerTypeEnum.enum.SSE ||
           value.type === McpServerTypeEnum.enum.STREAMABLE_HTTP
@@ -259,6 +261,10 @@ export function EditMcpServer({
             | "client_secret_basic"
             | "client_secret_post"
             | undefined) ?? "none",
+        // redirect_uri lives on the mcp_servers row itself (not
+        // oauth_sessions.client_information — see pre-registered-oauth.ts),
+        // so it prefills from `server`, not from existingOauthQuery.
+        oauth_redirect_uri: server.redirect_uri || "",
       });
     }
   }, [server, isOpen, editForm, existingOauthQuery.data]);
@@ -348,7 +354,8 @@ export function EditMcpServer({
         dirty.oauth_authorization_endpoint ||
         dirty.oauth_token_endpoint ||
         dirty.oauth_scope ||
-        dirty.oauth_token_endpoint_auth_method,
+        dirty.oauth_token_endpoint_auth_method ||
+        dirty.oauth_redirect_uri,
       );
       const oauthClientInfo =
         isHttpServer && oauthSectionTouched
@@ -361,6 +368,7 @@ export function EditMcpServer({
               scope: data.oauth_scope || undefined,
               token_endpoint_auth_method:
                 data.oauth_token_endpoint_auth_method || "none",
+              redirect_uri: data.oauth_redirect_uri?.trim() || undefined,
             }
           : undefined;
 
@@ -658,12 +666,13 @@ export function EditMcpServer({
                 }
                 idPrefix="edit"
                 defaultOpen={Boolean(
-                  existingOauthQuery.data?.success &&
-                  (
-                    existingOauthQuery.data.data.client_information as {
-                      client_id?: string;
-                    } | null
-                  )?.client_id,
+                  server?.redirect_uri ||
+                  (existingOauthQuery.data?.success &&
+                    (
+                      existingOauthQuery.data.data.client_information as {
+                        client_id?: string;
+                      } | null
+                    )?.client_id),
                 )}
               />
             </>

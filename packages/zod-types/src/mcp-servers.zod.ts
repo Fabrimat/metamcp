@@ -136,6 +136,13 @@ const oauthClientInfoBaseSchema = z.object({
   token_endpoint: z.string().optional(),
   scope: z.string().optional(),
   token_endpoint_auth_method: OAuthClientAuthMethodEnum.optional(),
+  // Per-server override for the redirect_uri MetaMCP registers/authorizes
+  // with the upstream (see isValidLoopbackRedirectUri below). Deliberately
+  // NOT included in oauthClientInfoIsBlank / the client_id-required
+  // refinement below: an upstream that only accepts loopback redirect URIs
+  // (e.g. Reclaim.ai) still supports RFC 7591 dynamic client registration,
+  // so a user may need to set ONLY this field with no client_id.
+  redirect_uri: z.string().optional(),
 });
 
 const isEmptyString = (value: string | undefined) =>
@@ -163,6 +170,40 @@ const isValidOptionalUrl = (value: string | undefined) => {
   }
 };
 
+// Hostnames accepted for the per-server redirect_uri override. Verified
+// live against Reclaim.ai's RFC 7591 dynamic client registration endpoint
+// (https://api.app.reclaim.ai/oauth2/register): `http://127.0.0.1` and
+// `http://localhost` (any port/path) are ACCEPTED; https on loopback is
+// REJECTED, as are any non-loopback hosts over http or https. `[::1]` is
+// also accepted here even though Reclaim itself rejects it — it is a
+// legitimate RFC 8252 §8.3 loopback address, and whether a given upstream
+// accepts it is that upstream's business, not ours to pre-empt.
+const LOOPBACK_REDIRECT_HOSTNAMES = new Set([
+  "127.0.0.1",
+  "localhost",
+  "[::1]",
+]);
+
+// Validates the per-server OAuth redirect_uri override. Deliberately
+// narrower than a generic URL check: this override's only purpose is
+// unblocking upstreams that only accept loopback redirect URIs, and this
+// value is later used verbatim as the browser authorize redirect and the
+// token-exchange redirect_uri. Allowing arbitrary hosts (https included)
+// would turn a per-server setting into an auth-code exfiltration vector.
+const isValidLoopbackRedirectUri = (value: string | undefined) => {
+  if (isEmptyString(value)) return true;
+  try {
+    const url = new URL(value as string);
+    return (
+      url.protocol === "http:" &&
+      LOOPBACK_REDIRECT_HOSTNAMES.has(url.hostname) &&
+      url.hash === ""
+    );
+  } catch {
+    return false;
+  }
+};
+
 // Validation rules applied to the request schemas: if ANY field in the
 // section is populated, client_id becomes required; URL fields must parse.
 export const OAuthClientInfoRequestSchema = oauthClientInfoBaseSchema
@@ -181,6 +222,11 @@ export const OAuthClientInfoRequestSchema = oauthClientInfoBaseSchema
   .refine((data) => isValidOptionalUrl(data.token_endpoint), {
     message: "token_endpoint must be a valid URL",
     path: ["token_endpoint"],
+  })
+  .refine((data) => isValidLoopbackRedirectUri(data.redirect_uri), {
+    message:
+      "redirect_uri must be a loopback URL: scheme http with hostname 127.0.0.1, localhost, or [::1] (any port/path allowed), no fragment",
+    path: ["redirect_uri"],
   });
 
 export type OAuthClientInfoRequest = z.infer<
@@ -199,6 +245,9 @@ const oauthClientInfoFormShape = {
   oauth_token_endpoint: z.string().optional(),
   oauth_scope: z.string().optional(),
   oauth_token_endpoint_auth_method: OAuthClientAuthMethodEnum.optional(),
+  // Not included in formOauthIsBlank below — see oauthClientInfoBaseSchema's
+  // redirect_uri field comment for why it must not require oauth_client_id.
+  oauth_redirect_uri: z.string().optional(),
 } as const;
 
 const formOauthIsBlank = (data: {
@@ -292,6 +341,10 @@ export const createServerFormSchema = z
   .refine((data) => isValidOptionalUrl(data.oauth_token_endpoint), {
     message: "validation:oauthTokenEndpoint.invalid",
     path: ["oauth_token_endpoint"],
+  })
+  .refine((data) => isValidLoopbackRedirectUri(data.oauth_redirect_uri), {
+    message: "validation:oauthRedirectUri.invalid",
+    path: ["oauth_redirect_uri"],
   });
 
 export type CreateServerFormData = z.infer<typeof createServerFormSchema>;
@@ -371,6 +424,10 @@ export const EditServerFormSchema = z
   .refine((data) => isValidOptionalUrl(data.oauth_token_endpoint), {
     message: "validation:oauthTokenEndpoint.invalid",
     path: ["oauth_token_endpoint"],
+  })
+  .refine((data) => isValidLoopbackRedirectUri(data.oauth_redirect_uri), {
+    message: "validation:oauthRedirectUri.invalid",
+    path: ["oauth_redirect_uri"],
   });
 
 export type EditServerFormData = z.infer<typeof EditServerFormSchema>;
@@ -440,6 +497,10 @@ export const McpServerSchema = z.object({
   forward_headers: z.record(z.string(), z.string()),
   user_id: z.string().nullable(),
   error_status: McpServerErrorStatusEnum.optional(),
+  // Per-server loopback-only redirect_uri override for upstream OAuth. See
+  // isValidLoopbackRedirectUri above. Null when unset (falls back to the
+  // APP_URL-derived MetaMCP callback).
+  redirect_uri: z.string().nullable(),
 });
 
 export const CreateMcpServerResponseSchema = z.object({
@@ -656,6 +717,7 @@ export const McpServerCreateInputSchema = z.object({
   headers: z.record(z.string(), z.string()).optional(),
   forward_headers: ForwardHeadersRecordSchema,
   user_id: z.string().nullable().optional(),
+  redirect_uri: z.string().nullable().optional(),
 });
 
 export const McpServerUpdateInputSchema = z.object({
@@ -681,6 +743,7 @@ export const McpServerUpdateInputSchema = z.object({
   headers: z.record(z.string(), z.string()).optional(),
   forward_headers: ForwardHeadersRecordSchema,
   user_id: z.string().nullable().optional(),
+  redirect_uri: z.string().nullable().optional(),
 });
 
 export type McpServerCreateInput = z.infer<typeof McpServerCreateInputSchema>;
@@ -702,6 +765,7 @@ export const DatabaseMcpServerSchema = z.object({
   headers: z.record(z.string(), z.string()),
   forward_headers: z.record(z.string(), z.string()),
   user_id: z.string().nullable(),
+  redirect_uri: z.string().nullable(),
 });
 
 export type DatabaseMcpServer = z.infer<typeof DatabaseMcpServerSchema>;

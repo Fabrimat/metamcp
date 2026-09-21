@@ -17,6 +17,7 @@ export class McpServersSerializer {
       headers: dbServer.headers,
       forward_headers: dbServer.forward_headers,
       user_id: dbServer.user_id,
+      redirect_uri: dbServer.redirect_uri,
     };
   }
 

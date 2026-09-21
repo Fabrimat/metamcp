@@ -204,6 +204,30 @@ export function AdvancedOAuthSection({
             </Select>
           </div>
 
+          <div className="flex flex-col gap-2">
+            <label
+              htmlFor={`${idPrefix}-oauth-redirect-uri`}
+              className="text-sm font-medium"
+            >
+              {t("mcp-servers:advancedOauth.redirectUri")}
+            </label>
+            <Input
+              id={`${idPrefix}-oauth-redirect-uri`}
+              {...form.register("oauth_redirect_uri")}
+              type="url"
+              placeholder="http://127.0.0.1:33418/callback"
+              autoComplete="off"
+            />
+            <p className="text-xs text-muted-foreground">
+              {t("mcp-servers:advancedOauth.redirectUriHelp")}
+            </p>
+            {errors.oauth_redirect_uri?.message && (
+              <p className="text-sm text-red-500">
+                {errors.oauth_redirect_uri.message}
+              </p>
+            )}
+          </div>
+
           <Button
             type="button"
             variant="ghost"
@@ -216,6 +240,7 @@ export function AdvancedOAuthSection({
               setOauthField("oauth_token_endpoint", "");
               setOauthField("oauth_scope", "");
               setOauthField("oauth_token_endpoint_auth_method", "none");
+              setOauthField("oauth_redirect_uri", "");
             }}
           >
             {t("mcp-servers:advancedOauth.clearFields")}

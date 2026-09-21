@@ -305,6 +305,7 @@ export const DatabaseNamespaceServerSchema = z.object({
   forward_headers: z.record(z.string(), z.string()),
   created_at: z.date(),
   user_id: z.string().nullable(),
+  redirect_uri: z.string().nullable(),
   status: McpServerStatusEnum,
   error_status: McpServerErrorStatusEnum.optional(),
 });
