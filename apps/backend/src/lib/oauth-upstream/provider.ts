@@ -57,6 +57,7 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
   private readonly mcpServerUuid: string;
   private readonly userId: string;
   private readonly redirectUriOverride: string | null;
+  private pendingState: string | undefined;
 
   // Populated by redirectToAuthorization() instead of navigating — see
   // that method. The tRPC handler (oauth.impl.ts) reads this after
@@ -115,6 +116,7 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
   ): Promise<void> {
     const patched: Record<string, unknown> = {
       ...clientInformation,
+      _metamcp_registration: "dynamic",
       redirect_uris: [this.redirectUrl],
     };
     await oauthSessionsRepository.upsert({
@@ -173,20 +175,17 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
     // pre-registered) discovery. Persist the context used for this redirect.
     const discovery = await this.discoveryState();
     if (discovery) await this.saveDiscoveryState(discovery);
-    const stateValue = createUpstreamState(this.mcpServerUuid);
-    await oauthSessionsRepository.upsert({
-      mcp_server_uuid: this.mcpServerUuid,
-      user_id: this.userId,
-      expected_state: stateValue,
-    });
-    return stateValue;
+    this.pendingState = createUpstreamState(this.mcpServerUuid);
+    return this.pendingState;
   }
 
   async saveCodeVerifier(codeVerifier: string): Promise<void> {
+    if (!this.pendingState) throw new Error("Authorization state missing");
     await oauthSessionsRepository.upsert({
       mcp_server_uuid: this.mcpServerUuid,
       user_id: this.userId,
       code_verifier: codeVerifier,
+      expected_state: this.pendingState,
     });
   }
 

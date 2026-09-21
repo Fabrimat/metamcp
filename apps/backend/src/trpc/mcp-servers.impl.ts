@@ -425,13 +425,8 @@ export const mcpServersImplementations = {
 
       if (oauthClientInfo) {
         try {
-          // `server.redirect_uri` (fetched above, BEFORE this update) is
-          // passed through so persistPreRegisteredOAuthClient can tell
-          // whether the override actually changed and invalidate any
-          // stale persisted registration — see the parameter's doc comment
-          // there for why that decision (and the delete) must happen
-          // inside that function, after it persists this call's own
-          // client_information, rather than as a separate step here.
+          // A server-wide redirect change invalidates every principal's old
+          // authorization material while preserving manual registration.
           await persistPreRegisteredOAuthClient(
             updatedServer.uuid,
             userId,

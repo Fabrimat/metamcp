@@ -612,29 +612,29 @@ export const oauthImplementations = {
         message: "Authorization URL created",
       };
     } catch (error) {
-      // Discovery/DCR failures throw MCP SDK OAuthError subclasses (e.g.
-      // Reclaim.ai rejecting a non-loopback redirect_uri with
-      // `invalid_redirect_uri`). Surface the upstream's own error code +
-      // message rather than a generic 500 — it's the user's main
-      // diagnostic for fixing their server config.
-      if (error instanceof OAuthError) {
-        logger.warn(
-          `[oauth] startAuthorization failed — server=${input.mcp_server_uuid} ` +
-            `error=${error.errorCode}`,
-        );
-        return {
-          success: false as const,
-          error: error.errorCode,
-          error_description: error.message,
-        };
-      }
-      // Any other thrown value is a programmer bug, not an upstream
-      // issue — same convention as exchangeToken above.
-      logger.error(
-        `[oauth] startAuthorization unexpected error for server ${input.mcp_server_uuid}:`,
-        error,
+      // SDK error messages can include raw response bodies and credentials.
+      const allowedCodes = new Set([
+        "invalid_client",
+        "invalid_redirect_uri",
+        "invalid_scope",
+        "invalid_client_metadata",
+        "unauthorized_client",
+        "server_error",
+        "temporarily_unavailable",
+      ]);
+      const code =
+        error instanceof OAuthError && allowedCodes.has(error.errorCode)
+          ? error.errorCode
+          : "upstream_error";
+      logger.warn(
+        `[oauth] startAuthorization failed — server=${input.mcp_server_uuid} error=${code}`,
       );
-      throw error;
+      return {
+        success: false as const,
+        error: code,
+        error_description:
+          "Upstream OAuth authorization failed. Check the configured client and provider endpoints, then retry.",
+      };
     }
   },
 };

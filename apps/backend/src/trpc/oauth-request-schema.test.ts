@@ -133,6 +133,7 @@ describe("OAuthClientInfoRequestSchema redirect_uri (loopback validation)", () =
     ["urn:ietf:wg:oauth:2.0:oob"],
     ["http://evil.com/cb"],
     ["http://127.0.0.1:33418/cb#frag"],
+    ["http://127.0.0.1:33418/cb#"],
   ])("rejects %s", (redirect_uri) => {
     const result = OAuthClientInfoRequestSchema.safeParse({ redirect_uri });
     expect(result.success).toBe(false);

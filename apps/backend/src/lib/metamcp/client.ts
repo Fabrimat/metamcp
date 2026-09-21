@@ -271,6 +271,7 @@ export const connectMetaMcpClient = async (
   );
   let count = 0;
   let retry = true;
+  let reactiveRefreshUsed = false;
 
   logger.info(
     `Connecting to server ${serverParams.name} (${serverParams.uuid}) with max attempts: ${maxAttempts}`,
@@ -308,7 +309,7 @@ export const connectMetaMcpClient = async (
       // See refreshIfExpiringSoon's doc comment for why the reactive
       // 401-refresh cascade below cannot substitute for this on every
       // upstream.
-      await refreshIfExpiringSoon(serverParams);
+      if (!reactiveRefreshUsed) await refreshIfExpiringSoon(serverParams);
 
       const result = createMetaMcpClient(serverParams);
       client = result.client;
@@ -460,10 +461,12 @@ export const connectMetaMcpClient = async (
       //    we fall through.
       if (
         isHttpServer &&
+        !reactiveRefreshUsed &&
         serverParams.oauth_user_id &&
         serverParams.oauth_tokens?.refresh_token &&
         isUpstreamUnauthorizedError(error)
       ) {
+        reactiveRefreshUsed = true;
         try {
           const refresh = await tryRefreshUpstreamTokens(serverParams);
           if (refresh.status === "refreshed" && refresh.tokens) {
@@ -505,6 +508,10 @@ export const connectMetaMcpClient = async (
           );
         }
       }
+
+      // Authentication failures are terminal after the single refresh/retry,
+      // regardless of the general connection backoff configuration.
+      if (isHttpServer && isUpstreamUnauthorizedError(error)) return undefined;
 
       // 2. Post-auth race recovery (issue #298): if tokens were issued
       //    recently AND the failure matches the empirical post-auth

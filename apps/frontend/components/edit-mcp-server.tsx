@@ -30,6 +30,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { useTranslations } from "@/hooks/useTranslations";
+import { oauthEditPayload } from "@/lib/oauth-form";
 import { trpc } from "@/lib/trpc";
 import { createTranslatedZodResolver } from "@/lib/zod-resolver";
 
@@ -344,33 +345,8 @@ export function EditMcpServer({
       // (e.g. fixing a typo in the description) would re-derive
       // `oauth_sessions.client_information` and potentially clobber an
       // SDK-populated row from a prior dynamic-registration flow.
-      const isHttpServer =
-        data.type === McpServerTypeEnum.enum.SSE ||
-        data.type === McpServerTypeEnum.enum.STREAMABLE_HTTP;
       const dirty = editForm.formState.dirtyFields as Record<string, unknown>;
-      const oauthSectionTouched = Boolean(
-        dirty.oauth_client_id ||
-        dirty.oauth_client_secret ||
-        dirty.oauth_authorization_endpoint ||
-        dirty.oauth_token_endpoint ||
-        dirty.oauth_scope ||
-        dirty.oauth_token_endpoint_auth_method ||
-        dirty.oauth_redirect_uri,
-      );
-      const oauthClientInfo =
-        isHttpServer && oauthSectionTouched
-          ? {
-              client_id: data.oauth_client_id?.trim() || undefined,
-              client_secret: data.oauth_client_secret || undefined,
-              authorization_endpoint:
-                data.oauth_authorization_endpoint || undefined,
-              token_endpoint: data.oauth_token_endpoint || undefined,
-              scope: data.oauth_scope || undefined,
-              token_endpoint_auth_method:
-                data.oauth_token_endpoint_auth_method || "none",
-              redirect_uri: data.oauth_redirect_uri?.trim() || undefined,
-            }
-          : undefined;
+      const oauthClientInfo = oauthEditPayload(data, dirty);
 
       // Create the API request payload
       const apiPayload: UpdateMcpServerRequest = {

@@ -39,6 +39,10 @@ vi.mock("../../index", () => ({
     select: () => ({
       from: () => ({
         where: (predicate: Predicate) => ({
+          then: (resolve: (rows: unknown[]) => unknown) =>
+            Promise.resolve(
+              [...store.values()].filter((row) => matches(row, predicate)),
+            ).then(resolve),
           limit: async (limit: number) =>
             [...store.values()]
               .filter((row) => matches(row, predicate))
@@ -146,8 +150,65 @@ vi.mock("../../index", () => ({
 }));
 
 const { OAuthSessionsRepository } = await import("../oauth-sessions.repo");
+const { oauthSessionsTable } = await import("../../schema");
 
 describe("OAuthSessionsRepository", () => {
+  it("invalidates redirect material for both users of a public server preserving manual registration", async () => {
+    const manual = {
+      client_id: "manual",
+      client_secret: "secret",
+      _metamcp_registration: "manual",
+      authorization_endpoint: "https://as.example/authorize",
+      token_endpoint: "https://as.example/token",
+    };
+    await repo.upsert({
+      mcp_server_uuid: serverId,
+      user_id: userA,
+      client_information: manual,
+      tokens: tokensA,
+      code_verifier: "A",
+      expected_state: "state-A",
+      discovery_state: { stale: true },
+    });
+    await repo.upsert({
+      mcp_server_uuid: serverId,
+      user_id: userB,
+      client_information: { client_id: "dynamic" },
+      tokens: tokensB,
+      code_verifier: "B",
+      expected_state: "state-B",
+      discovery_state: { stale: true },
+    });
+    await repo.upsert({
+      mcp_server_uuid: "other-server",
+      user_id: userA,
+      tokens: tokensA,
+    });
+    await repo.invalidateRedirectDependentSessions(
+      serverId,
+      "http://localhost:4001/callback",
+    );
+    expect(await repo.findByMcpServerAndUser(serverId, userA)).toMatchObject({
+      client_information: {
+        ...manual,
+        redirect_uris: ["http://localhost:4001/callback"],
+      },
+      tokens: null,
+      code_verifier: null,
+      expected_state: null,
+      discovery_state: null,
+    });
+    expect(await repo.findByMcpServerAndUser(serverId, userB)).toMatchObject({
+      client_information: {},
+      tokens: null,
+      code_verifier: null,
+      expected_state: null,
+      discovery_state: null,
+    });
+    expect(
+      (await repo.findByMcpServerAndUser("other-server", userA))?.tokens,
+    ).toEqual(tokensA);
+  });
   const repo = new OAuthSessionsRepository();
   const serverId = "00000000-0000-0000-0000-000000000001";
   const userA = "user-a";
@@ -332,7 +393,10 @@ describe("OAuthSessionsRepository", () => {
 
     expect(store.size).toBe(1);
     expect(valuesCalls).toHaveLength(2);
-    expect(onConflictTargetCalls[0]).toHaveLength(2);
+    expect(onConflictTargetCalls[0]).toEqual([
+      oauthSessionsTable.mcp_server_uuid,
+      oauthSessionsTable.user_id,
+    ]);
     expect(second.client_information).toEqual({ client_id: "client-B" });
   });
 

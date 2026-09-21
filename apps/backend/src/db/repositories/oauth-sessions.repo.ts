@@ -5,10 +5,49 @@ import {
 } from "@repo/zod-types";
 import { and, eq, sql } from "drizzle-orm";
 
+import { isManualOAuthClient } from "../../lib/oauth-upstream/client-registration";
 import { db } from "../index";
 import { oauthSessionsTable } from "../schema";
 
 export class OAuthSessionsRepository {
+  async invalidateRedirectDependentSessions(
+    mcpServerUuid: string,
+    redirectUri: string,
+  ): Promise<void> {
+    const sessions = await db
+      .select()
+      .from(oauthSessionsTable)
+      .where(eq(oauthSessionsTable.mcp_server_uuid, mcpServerUuid));
+    for (const session of sessions) {
+      const client = session.client_information as Record<
+        string,
+        unknown
+      > | null;
+      await db
+        .update(oauthSessionsTable)
+        .set({
+          client_information: isManualOAuthClient(client)
+            ? ({
+                ...client,
+                redirect_uris: [redirectUri],
+              } as unknown as typeof session.client_information)
+            : ({} as typeof session.client_information),
+          tokens: null,
+          code_verifier: null,
+          expected_state: null,
+          discovery_state: null,
+          updated_at: sql`NOW()`,
+        })
+        .where(
+          and(
+            eq(oauthSessionsTable.mcp_server_uuid, mcpServerUuid),
+            eq(oauthSessionsTable.user_id, session.user_id),
+          ),
+        )
+        .returning();
+    }
+  }
+
   async findByMcpServerAndUser(
     mcpServerUuid: string,
     userId: string,

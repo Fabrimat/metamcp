@@ -1,14 +1,25 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { createUpstreamState, parseUpstreamState } from "./state";
 
 const UUID = "00000000-0000-4000-8000-000000000003";
 
 describe("upstream OAuth state", () => {
+  it("rejects an expired attempt using its persisted timestamp", () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const state = createUpstreamState(UUID);
+      clock.mockReturnValue(now + 10 * 60 * 1000);
+      expect(parseUpstreamState(state)).toBeNull();
+    } finally {
+      clock.mockRestore();
+    }
+  });
   it("round trips a UUID with a fresh 32-byte nonce", () => {
     const state = createUpstreamState(UUID);
     expect(state).toMatch(
-      new RegExp(`^upstream\\.${UUID}\\.[A-Za-z0-9_-]{43}$`),
+      new RegExp(`^upstream\\.${UUID}\\.[0-9]{13}\\.[A-Za-z0-9_-]{43}$`),
     );
     expect(parseUpstreamState(state)).toBe(UUID);
     expect(createUpstreamState(UUID)).not.toBe(state);

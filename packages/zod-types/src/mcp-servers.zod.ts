@@ -197,7 +197,7 @@ const isValidLoopbackRedirectUri = (value: string | undefined) => {
     return (
       url.protocol === "http:" &&
       LOOPBACK_REDIRECT_HOSTNAMES.has(url.hostname) &&
-      url.hash === ""
+      !url.href.includes("#")
     );
   } catch {
     return false;

@@ -36,6 +36,7 @@ describe("buildPreRegisteredClientInformation", () => {
     );
 
     expect(result).toEqual({
+      _metamcp_registration: "manual",
       client_id: "3MVG9.Salesforce",
       redirect_uris: [REDIRECT_URI],
       grant_types: ["authorization_code", "refresh_token"],
@@ -59,6 +60,7 @@ describe("buildPreRegisteredClientInformation", () => {
     );
 
     expect(result).toEqual({
+      _metamcp_registration: "manual",
       client_id: "3MVG9.Salesforce",
       client_secret: "shhh",
       redirect_uris: [REDIRECT_URI],
@@ -141,6 +143,62 @@ describe("resolveRedirectUri", () => {
 });
 
 describe("persistPreRegisteredOAuthClient", () => {
+  it("preserves explicit manual client credentials on a redirect edit", async () => {
+    let stored: Record<string, unknown> | undefined = {
+      client_information: {
+        client_id: "manual",
+        client_secret: "secret",
+        _metamcp_registration: "manual",
+      },
+      tokens: { access_token: "old" },
+      code_verifier: "old",
+      expected_state: "old",
+    };
+    const repo = {
+      findByMcpServerAndUser: async () => stored,
+      upsert: async (input: Record<string, unknown>) => {
+        stored = { ...stored, ...input };
+      },
+      deleteByMcpServerAndUser: async () => {
+        stored = undefined;
+      },
+      invalidateRedirectDependentSessions: async () => {
+        stored = {
+          ...stored,
+          tokens: null,
+          code_verifier: null,
+          expected_state: null,
+          discovery_state: null,
+        };
+      },
+    } as unknown as OAuthSessionsRepository;
+    process.env.APP_URL = "https://metamcp.example.com";
+    await persistPreRegisteredOAuthClient(
+      "server",
+      "user",
+      {
+        client_id: "manual",
+        client_secret: "secret",
+        authorization_endpoint: "https://as.example/authorize",
+        token_endpoint: "https://as.example/token",
+        redirect_uri: "http://localhost:4001/callback",
+      },
+      repo,
+      "http://localhost:4000/callback",
+    );
+    expect(stored).toMatchObject({
+      client_information: {
+        client_id: "manual",
+        client_secret: "secret",
+        authorization_endpoint: "https://as.example/authorize",
+        token_endpoint: "https://as.example/token",
+        redirect_uris: ["http://localhost:4001/callback"],
+      },
+      tokens: null,
+      code_verifier: null,
+      expected_state: null,
+    });
+  });
   const SERVER_UUID = "00000000-0000-0000-0000-000000000001";
   const USER_ID = "user-1";
   const mockRepo = {
@@ -149,6 +207,7 @@ describe("persistPreRegisteredOAuthClient", () => {
     update: vi.fn(),
     upsert: vi.fn(),
     deleteByMcpServerAndUser: vi.fn(),
+    invalidateRedirectDependentSessions: vi.fn(),
   } as unknown as OAuthSessionsRepository & {
     findByMcpServerAndUser: ReturnType<typeof vi.fn>;
     upsert: ReturnType<typeof vi.fn>;
@@ -293,9 +352,9 @@ describe("persistPreRegisteredOAuthClient", () => {
       "http://127.0.0.1:4000/callback",
     );
 
-    expect(mockRepo.deleteByMcpServerAndUser).toHaveBeenCalledWith(
+    expect(mockRepo.invalidateRedirectDependentSessions).toHaveBeenCalledWith(
       SERVER_UUID,
-      USER_ID,
+      "http://127.0.0.1:5000/callback",
     );
   });
 
@@ -312,9 +371,9 @@ describe("persistPreRegisteredOAuthClient", () => {
       null,
     );
 
-    expect(mockRepo.deleteByMcpServerAndUser).toHaveBeenCalledWith(
+    expect(mockRepo.invalidateRedirectDependentSessions).toHaveBeenCalledWith(
       SERVER_UUID,
-      USER_ID,
+      "http://127.0.0.1:5000/callback",
     );
   });
 
@@ -331,9 +390,9 @@ describe("persistPreRegisteredOAuthClient", () => {
       "http://127.0.0.1:4000/callback",
     );
 
-    expect(mockRepo.deleteByMcpServerAndUser).toHaveBeenCalledWith(
+    expect(mockRepo.invalidateRedirectDependentSessions).toHaveBeenCalledWith(
       SERVER_UUID,
-      USER_ID,
+      REDIRECT_URI,
     );
   });
 
@@ -409,6 +468,9 @@ describe("persistPreRegisteredOAuthClient", () => {
         const deleted = stored;
         stored = undefined;
         return deleted;
+      }),
+      invalidateRedirectDependentSessions: vi.fn(async () => {
+        stored = undefined;
       }),
     } as unknown as OAuthSessionsRepository;
 

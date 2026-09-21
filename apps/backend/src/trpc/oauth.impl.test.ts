@@ -25,7 +25,9 @@ vi.mock("../utils/logger", () => ({
 }));
 
 const ORIGINAL_APP_URL = process.env.APP_URL;
-const stateFor = (uuid: string) => `upstream.${uuid}.${"a".repeat(43)}`;
+const TEST_STATE_TIME = Date.now();
+const stateFor = (uuid: string) =>
+  `upstream.${uuid}.${TEST_STATE_TIME}.${"a".repeat(43)}`;
 
 beforeEach(async () => {
   const { oauthSessionsRepository } = await import("../db/repositories");
@@ -36,7 +38,7 @@ beforeEach(async () => {
 
 describe("persisted OAuth protocol context", () => {
   const serverUuid = "00000000-0000-4000-8000-000000000003";
-  const state = `upstream.${serverUuid}.${"a".repeat(43)}`;
+  const state = stateFor(serverUuid);
   const discovery = {
     authorizationServerUrl: "https://identity.example/tenant",
     authorizationServerMetadata: {
@@ -121,6 +123,24 @@ describe("persisted OAuth protocol context", () => {
         "https://resource.example/mcp",
       );
     }
+  });
+
+  it("rejects expired state before claim or outbound exchange even after a recent row update", async () => {
+    const { oauthImplementations, oauthSessionsRepository, session, fetchSpy } =
+      await setup();
+    const expired = `upstream.${serverUuid}.${Date.now() - 600001}.${"a".repeat(43)}`;
+    session.expected_state = expired;
+    Object.assign(session, { updated_at: new Date() });
+    expect(
+      await oauthImplementations.exchangeToken(
+        { code: "C", state: expired },
+        "user-a",
+      ),
+    ).toMatchObject({ success: false, error: "invalid_state" });
+    expect(
+      oauthSessionsRepository.compareAndSetExpectedState,
+    ).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it("carries freshly discovered authorization server and resource through authorize, exchange and refresh", async () => {
@@ -1734,6 +1754,41 @@ describe("oauthImplementations.startAuthorization", () => {
   const USER_ID = "user-1";
   const SERVER_UUID = "00000000-0000-0000-0000-0000000000e1";
   const SERVER_URL = "https://mcp.example.com/mcp";
+
+  it("sanitizes malformed DCR response bodies in API and logs", async () => {
+    const { oauthImplementations, findServerByUuid, findByMcpServerAndUser } =
+      await loadModule();
+    findServerByUuid.mockResolvedValue(ownedServer(SERVER_UUID, SERVER_URL));
+    findByMcpServerAndUser.mockResolvedValue(undefined);
+    vi.mocked(fetch).mockImplementation(async (url) => {
+      if (String(url).includes("oauth-authorization-server"))
+        return jsonResponse(200, {
+          issuer: "https://mcp.example.com",
+          authorization_endpoint: "https://mcp.example.com/authorize",
+          token_endpoint: "https://mcp.example.com/token",
+          registration_endpoint: "https://mcp.example.com/register",
+          response_types_supported: ["code"],
+        });
+      if (String(url).endsWith("/register"))
+        return new Response("<html>client_secret=fixture_value</html>", {
+          status: 400,
+        });
+      return new Response("not found", { status: 404 });
+    });
+    const response = await oauthImplementations.startAuthorization(
+      { mcp_server_uuid: SERVER_UUID },
+      USER_ID,
+    );
+    expect(response.success).toBe(false);
+    expect(JSON.stringify(response)).not.toContain("fixture_value");
+    const { default: logger } = await import("../utils/logger");
+    expect(
+      JSON.stringify([
+        vi.mocked(logger.warn).mock.calls,
+        vi.mocked(logger.error).mock.calls,
+      ]),
+    ).not.toContain("fixture_value");
+  });
 
   it("returns access_denied when a different user owns the server (same ownership gate as exchangeToken/refreshToken)", async () => {
     const { oauthImplementations, findServerByUuid } = await loadModule();

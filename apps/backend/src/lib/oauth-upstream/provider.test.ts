@@ -58,13 +58,14 @@ describe("OAuthUpstreamClientProvider user-scoped persistence", () => {
 
   it("writes verifier state with the caller user id", async () => {
     const { provider, upsert } = await load();
-
+    const state = await provider.state();
     await provider.saveCodeVerifier("pkce-verifier");
 
     expect(upsert).toHaveBeenCalledWith({
       mcp_server_uuid: SERVER,
       user_id: USER,
       code_verifier: "pkce-verifier",
+      expected_state: state,
     });
   });
 
@@ -72,13 +73,37 @@ describe("OAuthUpstreamClientProvider user-scoped persistence", () => {
     const { provider, upsert } = await load();
     const state = await provider.state();
     expect(state).toMatch(
-      new RegExp(`^upstream\\.${SERVER}\\.[A-Za-z0-9_-]{43}$`),
+      new RegExp(`^upstream\\.${SERVER}\\.[0-9]{13}\\.[A-Za-z0-9_-]{43}$`),
     );
-    expect(upsert).toHaveBeenCalledWith({
-      mcp_server_uuid: SERVER,
-      user_id: USER,
-      expected_state: state,
+    expect(upsert).not.toHaveBeenCalled();
+  });
+
+  it("interleaved starts publish each state only with its own verifier", async () => {
+    const { provider: first, upsert } = await load();
+    const { provider: second } = await load();
+    const writes: Record<string, unknown>[] = [];
+    upsert.mockImplementation(async (input) => {
+      writes.push(input);
+      return input;
     });
+    const stateA = await first.state();
+    const stateB = await second.state();
+    await second.saveCodeVerifier("verifier-B");
+    await first.saveCodeVerifier("verifier-A");
+    expect(writes.filter((row) => row.expected_state)).toEqual([
+      {
+        mcp_server_uuid: SERVER,
+        user_id: USER,
+        expected_state: stateB,
+        code_verifier: "verifier-B",
+      },
+      {
+        mcp_server_uuid: SERVER,
+        user_id: USER,
+        expected_state: stateA,
+        code_verifier: "verifier-A",
+      },
+    ]);
   });
 
   it("prefers complete pre-registered endpoints over stale discovery", async () => {

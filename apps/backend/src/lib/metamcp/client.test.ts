@@ -294,6 +294,47 @@ describe("refreshIfExpiringSoon", () => {
 });
 
 describe("connectMetaMcpClient — reactive 401-refresh cascade", () => {
+  it.each([1, 5])(
+    "bounds persistent 401 to one refresh and retry with maxAttempts=%s",
+    async (maxAttempts) => {
+      const { serverErrorTracker } = await import("./server-error-tracker");
+      const attempts = vi
+        .spyOn(serverErrorTracker, "getServerMaxAttempts")
+        .mockResolvedValue(maxAttempts);
+      // A third call succeeds solely to make an unbounded implementation terminate.
+      clientConnect
+        .mockRejectedValueOnce(new Error("HTTP 401"))
+        .mockRejectedValueOnce(new Error("HTTP 401"))
+        .mockResolvedValue(undefined);
+      tryRefreshUpstreamTokens.mockResolvedValue({
+        status: "refreshed",
+        tokens: {
+          access_token: "NEW",
+          refresh_token: "RT",
+          token_type: "Bearer",
+          expires_at: Date.now() + 30000,
+        },
+      });
+      try {
+        expect(
+          await connectMetaMcpClient(
+            makeServer({
+              oauth_user_id: "user-1",
+              oauth_tokens: {
+                access_token: "OLD",
+                refresh_token: "RT",
+                token_type: "Bearer",
+              },
+            }),
+          ),
+        ).toBeUndefined();
+        expect(clientConnect).toHaveBeenCalledTimes(2);
+        expect(tryRefreshUpstreamTokens).toHaveBeenCalledTimes(1);
+      } finally {
+        attempts.mockRestore();
+      }
+    },
+  );
   beforeEach(() => {
     tryRefreshUpstreamTokens.mockReset();
     clientConnect.mockReset();

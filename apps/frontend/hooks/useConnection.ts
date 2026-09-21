@@ -499,7 +499,10 @@ export function useConnection({
 
             case McpServerTypeEnum.enum.SSE:
               mcpProxyServerUrl = new URL(`/mcp-proxy/server/sse`, getAppUrl());
-              mcpProxyServerUrl.searchParams.append("url", url);
+              mcpProxyServerUrl.searchParams.append(
+                "mcp_server_uuid",
+                mcpServerUuid,
+              );
               transportOptions = {
                 eventSourceInit: {
                   fetch: (
@@ -528,7 +531,10 @@ export function useConnection({
 
             case McpServerTypeEnum.enum.STREAMABLE_HTTP:
               mcpProxyServerUrl = new URL(`/mcp-proxy/server/mcp`, getAppUrl());
-              mcpProxyServerUrl.searchParams.append("url", url);
+              mcpProxyServerUrl.searchParams.append(
+                "mcp_server_uuid",
+                mcpServerUuid,
+              );
               transportOptions = {
                 eventSourceInit: {
                   fetch: (

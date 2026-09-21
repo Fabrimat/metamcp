@@ -1,5 +1,7 @@
 # 🚀 MetaMCP (MCP Aggregator, Orchestrator, Middleware, Gateway in one docker) <!-- omit in toc -->
 
+Upgrading native upstream OAuth runs migration 0020, which is incompatible with the previous binary. **App-only rollback after 0020 is forbidden:** restore the complete pre-deploy PostgreSQL dump and pass the [rollback guard and runbook](deploy/oauth-rollback.md) before starting the old image. Restoration discards post-backup writes.
+
 <div align="center">
 
 <div align="center">

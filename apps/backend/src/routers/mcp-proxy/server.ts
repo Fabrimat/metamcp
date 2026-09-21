@@ -1,9 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import {
-  SSEClientTransport,
-  SseError,
-} from "@modelcontextprotocol/sdk/client/sse.js";
+import { SseError } from "@modelcontextprotocol/sdk/client/sse.js";
 import { getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -18,18 +15,11 @@ import logger from "@/utils/logger";
 
 import { mcpServersRepository } from "../../db/repositories";
 import mcpProxy from "../../lib/mcp-proxy";
-import { transformDockerUrl } from "../../lib/metamcp/client";
 import { mcpServerPool } from "../../lib/metamcp/mcp-server-pool";
 import { resolveEnvVariables } from "../../lib/metamcp/utils";
 import { ProcessManagedStdioTransport } from "../../lib/stdio-transport/process-managed-transport";
 import { betterAuthMcpMiddleware } from "../../middleware/better-auth-mcp.middleware";
-
-const SSE_HEADERS_PASSTHROUGH = ["authorization"];
-const STREAMABLE_HTTP_HEADERS_PASSTHROUGH = [
-  "authorization",
-  "mcp-session-id",
-  "last-event-id",
-];
+import { createDirectHttpTransport } from "./direct-http";
 
 const defaultEnvironment = {
   ...getDefaultEnvironment(),
@@ -149,44 +139,6 @@ const checkServerErrorStatus = async (serverUuid: string): Promise<boolean> => {
   }
 };
 
-// Function to get HTTP headers.
-// Supports only "SSE" and "STREAMABLE_HTTP" transport types.
-const getHttpHeaders = (
-  req: express.Request,
-  transportType: string,
-): Record<string, string> => {
-  const headers: Record<string, string> = {
-    Accept:
-      transportType === McpServerTypeEnum.enum.SSE
-        ? "text/event-stream"
-        : "text/event-stream, application/json",
-  };
-  const defaultHeaders =
-    transportType === McpServerTypeEnum.enum.SSE
-      ? SSE_HEADERS_PASSTHROUGH
-      : STREAMABLE_HTTP_HEADERS_PASSTHROUGH;
-
-  for (const key of defaultHeaders) {
-    if (req.headers[key] === undefined) {
-      continue;
-    }
-
-    const value = req.headers[key];
-    headers[key] = Array.isArray(value) ? value[value.length - 1] : value;
-  }
-
-  // If the header "x-custom-auth-header" is present, use its value as the custom header name.
-  if (req.headers["x-custom-auth-header"] !== undefined) {
-    const customHeaderName = req.headers["x-custom-auth-header"] as string;
-    const lowerCaseHeaderName = customHeaderName.toLowerCase();
-    if (req.headers[lowerCaseHeaderName] !== undefined) {
-      const value = req.headers[lowerCaseHeaderName];
-      headers[customHeaderName] = value as string;
-    }
-  }
-  return headers;
-};
-
 const serverRouter = express.Router();
 
 // Apply better auth middleware to all MCP proxy routes
@@ -230,7 +182,9 @@ const cleanupSession = async (sessionId: string) => {
   logger.info(`Session ${sessionId} cleanup completed`);
 };
 
-const createTransport = async (req: express.Request): Promise<Transport> => {
+export const createTransport = async (
+  req: express.Request,
+): Promise<Transport> => {
   const query = req.query;
   logger.info("Query parameters:", JSON.stringify(query));
 
@@ -292,73 +246,11 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
       );
       throw error;
     }
-  } else if (transportType === McpServerTypeEnum.enum.SSE) {
-    const url = transformDockerUrl(query.url as string);
-
-    // Check if the server is in error state (for SSE, we need to find server by URL)
-    const servers = await mcpServersRepository.findAll();
-    const matchingServer = servers.find(
-      (server) => server.type === "SSE" && server.url === url,
-    );
-    if (matchingServer) {
-      const isInError = await checkServerErrorStatus(matchingServer.uuid);
-      if (isInError) {
-        throw new Error(
-          `Server is in error state and cannot be connected to. Please check the server configuration and try again later.`,
-        );
-      }
-    }
-
-    // Merge custom headers from database with passthrough headers from request
-    const headers = {
-      ...(matchingServer?.headers || {}),
-      ...getHttpHeaders(req, transportType),
-    };
-
-    logger.info(
-      `SSE transport: url=${url}, headers=${JSON.stringify(headers)}`,
-    );
-
-    const transport = new SSEClientTransport(new URL(url), {
-      eventSourceInit: {
-        fetch: (url, init) => fetch(url, { ...init, headers }),
-      },
-      requestInit: {
-        headers,
-      },
-    });
-    await transport.start();
-    return transport;
-  } else if (transportType === McpServerTypeEnum.enum.STREAMABLE_HTTP) {
-    const url = transformDockerUrl(query.url as string);
-
-    // Check if the server is in error state (for STREAMABLE_HTTP, we need to find server by URL)
-    const servers = await mcpServersRepository.findAll();
-    const matchingServer = servers.find(
-      (server) => server.type === "STREAMABLE_HTTP" && server.url === url,
-    );
-    if (matchingServer) {
-      const isInError = await checkServerErrorStatus(matchingServer.uuid);
-      if (isInError) {
-        throw new Error(
-          `Server is in error state and cannot be connected to. Please check the server configuration and try again later.`,
-        );
-      }
-    }
-
-    // Merge custom headers from database with passthrough headers from request
-    const headers = {
-      ...(matchingServer?.headers || {}),
-      ...getHttpHeaders(req, transportType),
-    };
-
-    const transport = new StreamableHTTPClientTransport(new URL(url), {
-      requestInit: {
-        headers,
-      },
-    });
-    await transport.start();
-    return transport;
+  } else if (
+    transportType === McpServerTypeEnum.enum.SSE ||
+    transportType === McpServerTypeEnum.enum.STREAMABLE_HTTP
+  ) {
+    return createDirectHttpTransport(req);
   } else {
     logger.error(`Invalid transport type: ${transportType}`);
     throw new Error("Invalid transport type specified");

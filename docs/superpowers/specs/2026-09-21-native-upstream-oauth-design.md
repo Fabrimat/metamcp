@@ -131,7 +131,7 @@ The deployment sequence is:
 7. recreate only the application service and allow the entrypoint to run migrations;
 8. verify container health, migration logs, frontend/backend availability, and the real OAuth flow.
 
-The previous image ID receives a local rollback tag before deployment. If application verification fails, the override is returned to that image and only the application service is recreated. Additive database columns and tables may remain in place for rollback; the database backup is restored only if a migration damages existing data.
+The previous image ID receives a local rollback tag before deployment. Migration 0020 is incompatible with the pre-feature binary: app-only rollback is forbidden once 0020 has run. Stop all application writers, restore the complete pre-deploy PostgreSQL dump (including the migration journal), run `deploy/oauth-rollback-guard.sql` with `ON_ERROR_STOP=1`, and only then start the recorded previous image. Restoring the backup discards writes made after the backup. Follow [the rollback runbook](../../../deploy/oauth-rollback.md); restoration is mandatory even when no data corruption occurred.
 
 ## Implementation Boundaries
 
