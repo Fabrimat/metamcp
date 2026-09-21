@@ -64,6 +64,10 @@ export class McpServerPool {
   // stale generation knows to discard its result instead of storing it.
   private idleSessionGenerations: Record<string, number> = {};
 
+  // Blocks runtime acquisition while an administrative update atomically swaps
+  // every principal-scoped connection generation for a server.
+  private administrativelyInvalidatingServers: Set<string> = new Set();
+
   // Session cleanup timer
   private cleanupTimer: NodeJS.Timeout | null = null;
 
@@ -211,6 +215,12 @@ export class McpServerPool {
     params: ServerParameters,
     namespaceUuid?: string,
   ): Promise<ConnectedClient | undefined> {
+    if (this.administrativelyInvalidatingServers.has(serverUuid)) {
+      logger.warn(
+        `Server ${serverUuid} is being administratively invalidated; deferring connection acquisition`,
+      );
+      return undefined;
+    }
     const cacheKey = connectionKey(serverUuid, params.oauth_user_id);
     // Update server params cache
     this.serverParamsCache[cacheKey] = params;
@@ -830,83 +840,62 @@ export class McpServerPool {
     namespaceUuid?: string,
   ): Promise<void> {
     logger.info(`Invalidating idle session for server ${serverUuid}`);
+    this.administrativelyInvalidatingServers.add(serverUuid);
 
-    // An administrative server update changes connection parameters for every
-    // principal. This is deliberately separate from recovery invalidation so
-    // its cleanup and logging retain administrative semantics.
-    const activeClients = new Set<ConnectedClient>();
-    for (const [sessionId, sessionServers] of Object.entries(
-      this.activeSessions,
-    )) {
-      for (const [existingKey, client] of Object.entries(sessionServers)) {
+    try {
+      // Everything through the end of this block is synchronous. Detach all
+      // old active/idle/cache/pending state before any cleanup can yield and
+      // let a concurrent getSession observe the old generation.
+      const existingKeys = this.getKnownConnectionKeysForServer(serverUuid);
+      const clientsToCleanup = new Set<ConnectedClient>();
+
+      for (const [sessionId, sessionServers] of Object.entries(
+        this.activeSessions,
+      )) {
+        for (const [existingKey, client] of Object.entries(sessionServers)) {
+          if (!connectionKeyBelongsToServer(existingKey, serverUuid)) {
+            continue;
+          }
+          clientsToCleanup.add(client);
+          delete sessionServers[existingKey];
+          this.sessionToServers[sessionId]?.delete(existingKey);
+        }
+      }
+
+      for (const [existingKey, client] of Object.entries(this.idleSessions)) {
         if (!connectionKeyBelongsToServer(existingKey, serverUuid)) {
           continue;
         }
-        activeClients.add(client);
-        delete sessionServers[existingKey];
-        this.sessionToServers[sessionId]?.delete(existingKey);
+        clientsToCleanup.add(client);
+        delete this.idleSessions[existingKey];
       }
-    }
-    await Promise.all(
-      [...activeClients].map(async (client) => {
-        try {
-          await client.cleanup();
-        } catch (error) {
-          logger.error(
-            `Error cleaning up active connection during administrative update for ${serverUuid}:`,
-            error,
-          );
-        }
-      }),
-    );
 
-    const cacheKey = connectionKey(serverUuid, params.oauth_user_id);
-
-    // Update server params cache
-    this.serverParamsCache[cacheKey] = params;
-
-    // A server configuration change invalidates every principal-scoped idle
-    // connection for this server. A later namespace request repopulates its own
-    // principal slot with freshly resolved parameters.
-    for (const existingKey of this.getKnownConnectionKeysForServer(
-      serverUuid,
-    )) {
-      const existingIdleSession = this.idleSessions[existingKey];
-      if (existingKey !== cacheKey) {
+      for (const existingKey of existingKeys) {
         delete this.serverParamsCache[existingKey];
-      }
-      if (!existingIdleSession) {
         this.idleSessionGenerations[existingKey] =
           (this.idleSessionGenerations[existingKey] ?? 0) + 1;
         this.creatingIdleSessions.delete(existingKey);
-        continue;
       }
-      try {
-        await existingIdleSession.cleanup();
-        logger.info(
-          `Cleaned up existing idle session for server ${serverUuid}`,
-        );
-      } catch (error) {
-        logger.error(
-          `Error cleaning up existing idle session for server ${serverUuid}:`,
-          error,
-        );
-      }
-      delete this.idleSessions[existingKey];
-      this.idleSessionGenerations[existingKey] =
-        (this.idleSessionGenerations[existingKey] ?? 0) + 1;
-      this.creatingIdleSessions.delete(existingKey);
+
+      await Promise.all(
+        [...clientsToCleanup].map(async (client) => {
+          try {
+            await client.cleanup();
+          } catch (error) {
+            logger.error(
+              `Error cleaning up connection during administrative update for ${serverUuid}:`,
+              error,
+            );
+          }
+        }),
+      );
+
+      const cacheKey = connectionKey(serverUuid, params.oauth_user_id);
+      this.serverParamsCache[cacheKey] = params;
+      await this.createIdleSession(serverUuid, params, namespaceUuid);
+    } finally {
+      this.administrativelyInvalidatingServers.delete(serverUuid);
     }
-
-    // Bump the generation before clearing the in-progress guard so any
-    // in-flight createIdleSession / createIdleSessionAsync that resolves
-    // after this point will see a stale generation and discard its result.
-    this.idleSessionGenerations[cacheKey] =
-      (this.idleSessionGenerations[cacheKey] ?? 0) + 1;
-    this.creatingIdleSessions.delete(cacheKey);
-
-    // Create a new idle session with updated parameters
-    await this.createIdleSession(serverUuid, params, namespaceUuid);
   }
 
   /**

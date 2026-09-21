@@ -125,6 +125,14 @@ function makePool(maxConnectionsPerServer = 5): McpServerPool {
   return new PoolConstructor(0, 100, maxConnectionsPerServer);
 }
 
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let release: (() => void) | undefined;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, resolve: () => release?.() };
+}
+
 describe("refreshIfExpiringSoon", () => {
   beforeEach(() => {
     tryRefreshUpstreamTokens.mockReset();
@@ -485,6 +493,91 @@ describe("McpServerPool — OAuth principal cache identity", () => {
       expect(nextA).not.toBe(firstA);
       expect(nextB).not.toBe(firstB);
     } finally {
+      await pool.cleanupAll();
+    }
+  });
+
+  it("atomically detaches old active and idle generations before administrative cleanup awaits", async () => {
+    clientConnect.mockReset();
+    clientConnect.mockResolvedValue(undefined);
+    MockStreamableHTTPClientTransport.instances.length = 0;
+    const pool = makePool();
+    const oldParams = makeServer({
+      oauth_user_id: "user-a",
+      oauth_tokens: { access_token: "OLD_TOKEN", token_type: "Bearer" },
+    });
+    const newParams = makeServer({
+      oauth_user_id: "user-a",
+      oauth_tokens: { access_token: "NEW_TOKEN", token_type: "Bearer" },
+    });
+    const poolState = pool as unknown as {
+      idleSessions: Record<string, { cleanup: () => Promise<void> }>;
+    };
+    const cleanupGate = deferred();
+    let invalidation: Promise<void> | undefined;
+
+    try {
+      await pool.ensureIdleSessions(
+        { [oldParams.uuid]: oldParams },
+        "namespace-a",
+      );
+      const active = await pool.getSession(
+        "active-session",
+        oldParams.uuid,
+        oldParams,
+        "namespace-a",
+      );
+      expect(active).toBeDefined();
+      if (!active) {
+        throw new Error("expected an active old-generation connection");
+      }
+
+      await vi.waitFor(() => {
+        expect(Object.values(poolState.idleSessions)).toHaveLength(1);
+      });
+      const oldIdle = Object.values(poolState.idleSessions)[0];
+      const activeCleanup = vi
+        .spyOn(active, "cleanup")
+        .mockImplementation(() => cleanupGate.promise);
+      const idleCleanup = vi.spyOn(oldIdle, "cleanup");
+
+      invalidation = pool.invalidateIdleSession(
+        oldParams.uuid,
+        newParams,
+        "namespace-a",
+      );
+      await vi.waitFor(() => {
+        expect(activeCleanup).toHaveBeenCalledTimes(1);
+      });
+
+      const raced = await pool.getSession(
+        "racing-session",
+        oldParams.uuid,
+        oldParams,
+        "namespace-a",
+      );
+
+      cleanupGate.resolve();
+      await invalidation;
+
+      expect(raced).toBeUndefined();
+      expect(idleCleanup).toHaveBeenCalledTimes(1);
+
+      const next = await pool.getSession(
+        "next-session",
+        newParams.uuid,
+        newParams,
+        "namespace-a",
+      );
+      expect(next).toBeDefined();
+      expect(next).not.toBe(active);
+      expect(next).not.toBe(oldIdle);
+      expect(
+        authHeaderOf(MockStreamableHTTPClientTransport.instances.at(-1)),
+      ).toBe("Bearer NEW_TOKEN");
+    } finally {
+      cleanupGate.resolve();
+      await invalidation?.catch(() => undefined);
       await pool.cleanupAll();
     }
   });
