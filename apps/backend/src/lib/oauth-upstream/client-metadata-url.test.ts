@@ -21,11 +21,21 @@ describe("resolveOAuthClientMetadataUrl", () => {
     expect(resolveOAuthClientMetadataUrl()).toBe(value);
   });
 
+  it("rejects a metadata URL whose pathname is not the gateway route", () => {
+    process.env.OAUTH_CLIENT_METADATA_URL =
+      "https://oauth.example/other/client-metadata";
+    expect(() => resolveOAuthClientMetadataUrl()).toThrow(
+      /OAUTH_CLIENT_METADATA_URL/,
+    );
+  });
+
   it.each([
     "",
     "not-a-url",
     "http://oauth.example/oauth/client-metadata",
     "https://oauth.example/",
+    "https://oauth.example/oauth/../oauth/client-metadata",
+    "https://oauth.example/oauth/%2e%2e/oauth/client-metadata",
     "https://user:password@oauth.example/oauth/client-metadata",
     "https://oauth.example/oauth/client-metadata?",
     "https://oauth.example/oauth/client-metadata?return=https://evil.example",

@@ -539,13 +539,6 @@ export const oauthImplementations = {
     // column, which that helper doesn't expose.
     const server = await mcpServersRepository.findByUuid(input.mcp_server_uuid);
 
-    const provider = new OAuthUpstreamClientProvider({
-      mcpServerUuid: input.mcp_server_uuid,
-      userId,
-      serverUrl,
-      redirectUriOverride: server?.redirect_uri ?? null,
-    });
-
     // SEP-835 scope selection: pass the user's pre-registered scope (if
     // any) as `options.scope` so it takes precedence exactly as the SDK
     // intends — auth()'s precedence is options.scope > PRM
@@ -565,6 +558,23 @@ export const oauthImplementations = {
           "Confirm the saved OAuth client configuration before authorizing.",
       };
     }
+    const persistedRedirectUris = clientInformation?.redirect_uris;
+    const persistedRedirectUri =
+      clientInformation?._metamcp_registration !== "url_based" &&
+      Array.isArray(persistedRedirectUris) &&
+      typeof persistedRedirectUris[0] === "string" &&
+      persistedRedirectUris[0].length > 0
+        ? persistedRedirectUris[0]
+        : null;
+    const provider = new OAuthUpstreamClientProvider({
+      mcpServerUuid: input.mcp_server_uuid,
+      userId,
+      serverUrl,
+      // Existing manual/DCR registrations remain bound to the redirect URI
+      // they were registered with. URL-based registrations are regenerated
+      // by the provider when their metadata URL is stale.
+      redirectUriOverride: persistedRedirectUri ?? server?.redirect_uri ?? null,
+    });
     const scope =
       typeof clientInformation?.scope === "string" &&
       clientInformation.scope.length > 0

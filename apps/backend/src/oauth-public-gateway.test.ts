@@ -1,3 +1,4 @@
+import { request } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -5,6 +6,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOAuthPublicGateway } from "./oauth-public-gateway";
 
 const METADATA_URL = "https://oauth.example/oauth/client-metadata";
+const STATE_SERVER_UUID = "00000000-0000-4000-8000-0000000000e1";
+
+function freshState(timestamp = Date.now()) {
+  return `upstream.${STATE_SERVER_UUID}.${timestamp}.${"a".repeat(43)}`;
+}
 
 async function withGateway(
   env: NodeJS.ProcessEnv,
@@ -33,6 +39,26 @@ type TestLogger = {
   info: ReturnType<typeof vi.fn>;
   error: ReturnType<typeof vi.fn>;
 };
+
+async function rawRequestStatus(baseUrl: string, target: string) {
+  const base = new URL(baseUrl);
+  return new Promise<number>((resolve, reject) => {
+    const outgoing = request(
+      {
+        hostname: base.hostname,
+        port: base.port,
+        method: "GET",
+        path: target,
+      },
+      (response) => {
+        response.resume();
+        response.once("end", () => resolve(response.statusCode ?? 0));
+      },
+    );
+    outgoing.once("error", reject);
+    outgoing.end();
+  });
+}
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -120,6 +146,20 @@ describe("OAuth public gateway metadata", () => {
       },
     );
   });
+
+  it.each([
+    "/oauth/../oauth/client-metadata",
+    "/oauth/%2e%2e/oauth/client-metadata",
+    "//alias.invalid/oauth/client-metadata",
+    "http://alias.invalid/oauth/client-metadata",
+  ])("rejects non-canonical raw request target %s", async (target) => {
+    await withGateway(
+      { OAUTH_CLIENT_METADATA_URL: METADATA_URL },
+      async (baseUrl) => {
+        expect(await rawRequestStatus(baseUrl, target)).toBe(404);
+      },
+    );
+  });
 });
 
 describe("OAuth public gateway callback relay", () => {
@@ -130,8 +170,9 @@ describe("OAuth public gateway callback relay", () => {
         APP_URL: "http://metamcp-app:12008",
       },
       async (baseUrl) => {
+        const state = freshState();
         const response = await fetch(
-          `${baseUrl}/oauth/client-metadata?code=auth-code&state=trusted-state`,
+          `${baseUrl}/oauth/client-metadata?code=auth-code&state=${state}`,
           {
             redirect: "manual",
             headers: {
@@ -143,7 +184,7 @@ describe("OAuth public gateway callback relay", () => {
         );
         expect(response.status).toBe(303);
         expect(response.headers.get("location")).toBe(
-          "http://metamcp-app:12008/fe-oauth/callback?code=auth-code&state=trusted-state",
+          `http://metamcp-app:12008/fe-oauth/callback?code=auth-code&state=${state}`,
         );
         expect(response.headers.get("cache-control")).toBe("no-store");
         expect(response.headers.get("referrer-policy")).toBe("no-referrer");
@@ -163,14 +204,35 @@ describe("OAuth public gateway callback relay", () => {
         APP_URL: "https://private.example/base",
       },
       async (baseUrl) => {
+        const state = freshState();
         const response = await fetch(
-          `${baseUrl}/oauth/client-metadata?error=access_denied&error_description=User+declined&state=s1`,
+          `${baseUrl}/oauth/client-metadata?error=access_denied&error_description=User+declined&state=${state}`,
           { redirect: "manual" },
         );
         expect(response.status).toBe(303);
         expect(response.headers.get("location")).toBe(
-          "https://private.example/base/fe-oauth/callback?error=access_denied&error_description=User+declined&state=s1",
+          `https://private.example/base/fe-oauth/callback?error=access_denied&error_description=User+declined&state=${state}`,
         );
+      },
+    );
+  });
+
+  it.each([
+    "not-an-upstream-state",
+    freshState(Date.now() - 10 * 60 * 1000 - 1),
+  ])("rejects malformed or expired upstream state %s", async (state) => {
+    await withGateway(
+      {
+        OAUTH_CLIENT_METADATA_URL: METADATA_URL,
+        APP_URL: "http://metamcp-app:12008",
+      },
+      async (baseUrl) => {
+        const response = await fetch(
+          `${baseUrl}/oauth/client-metadata?code=auth-code&state=${state}`,
+          { redirect: "manual" },
+        );
+        expect(response.status).toBe(400);
+        expect(response.headers.get("cache-control")).toBe("no-store");
       },
     );
   });
@@ -228,8 +290,9 @@ describe("OAuth public gateway callback relay", () => {
         APP_URL: "http://metamcp-app:12008",
       },
       async (baseUrl, logger) => {
+        const state = freshState();
         await fetch(
-          `${baseUrl}/oauth/client-metadata?code=super-secret-code&state=super-secret-state`,
+          `${baseUrl}/oauth/client-metadata?code=super-secret-code&state=${state}`,
           { redirect: "manual" },
         );
         const logs = JSON.stringify([
@@ -237,7 +300,7 @@ describe("OAuth public gateway callback relay", () => {
           logger.error.mock.calls,
         ]);
         expect(logs).not.toContain("super-secret-code");
-        expect(logs).not.toContain("super-secret-state");
+        expect(logs).not.toContain(state);
         expect(logs).not.toContain("?");
       },
     );

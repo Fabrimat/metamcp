@@ -13,10 +13,16 @@ export function resolveOAuthClientMetadataUrl(
     );
   }
 
+  const authorityStart = value.indexOf("://") + 3;
+  const pathStart = value.indexOf("/", authorityStart);
+  const rawPath =
+    pathStart < 0 ? "/" : value.slice(pathStart).split(/[?#]/, 1)[0];
+
   if (
     value.length === 0 ||
     url.protocol !== "https:" ||
-    url.pathname === "/" ||
+    url.pathname !== "/oauth/client-metadata" ||
+    rawPath !== "/oauth/client-metadata" ||
     url.username !== "" ||
     url.password !== "" ||
     value.includes("?") ||
@@ -25,7 +31,7 @@ export function resolveOAuthClientMetadataUrl(
     url.hash !== ""
   ) {
     throw new Error(
-      "OAUTH_CLIENT_METADATA_URL must use HTTPS with a non-root path and no credentials, query, or fragment",
+      "OAUTH_CLIENT_METADATA_URL must use HTTPS at /oauth/client-metadata with no credentials, query, or fragment",
     );
   }
 

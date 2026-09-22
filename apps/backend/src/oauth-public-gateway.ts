@@ -6,6 +6,7 @@ import {
 import { pathToFileURL } from "node:url";
 
 import { resolveOAuthClientMetadataUrl } from "./lib/oauth-upstream/client-metadata-url";
+import { parseUpstreamState } from "./lib/oauth-upstream/state";
 
 const METADATA_PATH = "/oauth/client-metadata";
 const CALLBACK_PATH = "/fe-oauth/callback";
@@ -119,7 +120,12 @@ function parseCallback(requestUrl: string, url: URL): URLSearchParams | null {
   }
 
   const state = stateValues[0];
-  if (!state || !isSafeOpaqueValue(state, 4096)) return null;
+  if (
+    !state ||
+    !isSafeOpaqueValue(state, 4096) ||
+    parseUpstreamState(state) === null
+  )
+    return null;
 
   const output = new URLSearchParams();
   if (codeValues.length === 1) {
@@ -146,16 +152,19 @@ export function createOAuthPublicGateway(options: GatewayOptions = {}) {
 
   return createServer((request: IncomingMessage, response: ServerResponse) => {
     const requestUrl = request.url ?? "/";
+    const queryIndex = requestUrl.indexOf("?");
+    const rawPath =
+      queryIndex < 0 ? requestUrl : requestUrl.slice(0, queryIndex);
+    if (rawPath !== METADATA_PATH) {
+      sendEmpty(response, 404);
+      return;
+    }
+
     let url: URL;
     try {
       url = new URL(requestUrl, "http://oauth-gateway.invalid");
     } catch {
       sendEmpty(response, 400, callbackHeaders);
-      return;
-    }
-
-    if (url.pathname !== METADATA_PATH) {
-      sendEmpty(response, 404);
       return;
     }
 

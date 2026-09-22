@@ -1982,50 +1982,93 @@ describe("oauthImplementations.startAuthorization", () => {
     );
   });
 
-  it("keeps a persisted manual client authoritative when CIMD is configured", async () => {
-    const metadataUrl = "https://oauth.example/oauth/client-metadata";
-    process.env.OAUTH_CLIENT_METADATA_URL = metadataUrl;
-    const {
-      oauthImplementations,
-      findByMcpServerAndUser,
-      findServerByUuid,
-      saveDynamicClientInformation,
-    } = await loadModule();
-    findServerByUuid.mockResolvedValue(ownedServer(SERVER_UUID, SERVER_URL));
-    findByMcpServerAndUser.mockResolvedValue({
-      mcp_server_uuid: SERVER_UUID,
-      user_id: USER_ID,
-      client_information: {
-        client_id: "manual-client",
-        client_secret: "manual-secret",
-        _metamcp_registration: "manual",
-      },
-      discovery_state: {
-        authorizationServerUrl: "https://mcp.example.com",
-        authorizationServerMetadata: {
-          issuer: "https://mcp.example.com",
-          authorization_endpoint: "https://mcp.example.com/authorize",
-          token_endpoint: "https://mcp.example.com/token",
-          response_types_supported: ["code"],
-          client_id_metadata_document_supported: true,
+  it.each(["manual", "dynamic"] as const)(
+    "keeps an existing %s registration's persisted redirect byte-identical when CIMD is configured",
+    async (registrationKind) => {
+      const metadataUrl = "https://oauth.example/oauth/client-metadata";
+      const persistedRedirect = `https://legacy.example/${registrationKind}/callback`;
+      process.env.OAUTH_CLIENT_METADATA_URL = metadataUrl;
+      const {
+        oauthImplementations,
+        findByMcpServerAndUser,
+        findServerByUuid,
+        saveDynamicClientInformation,
+        upsert,
+      } = await loadModule();
+      findServerByUuid.mockResolvedValue(
+        ownedServer(SERVER_UUID, SERVER_URL, {
+          redirectUri: "http://127.0.0.1:9999/new-callback",
+        }),
+      );
+      const session = {
+        mcp_server_uuid: SERVER_UUID,
+        user_id: USER_ID,
+        client_information: {
+          client_id: `${registrationKind}-client`,
+          _metamcp_registration: registrationKind,
+          redirect_uris: [persistedRedirect],
+          token_endpoint_auth_method: "none",
         },
-      },
-    });
+        discovery_state: {
+          authorizationServerUrl: "https://mcp.example.com",
+          authorizationServerMetadata: {
+            issuer: "https://mcp.example.com",
+            authorization_endpoint: "https://mcp.example.com/authorize",
+            token_endpoint: "https://mcp.example.com/token",
+            response_types_supported: ["code"],
+            client_id_metadata_document_supported: true,
+          },
+        },
+        code_verifier: null,
+        expected_state: null,
+        tokens: null,
+      };
+      findByMcpServerAndUser.mockResolvedValue(session);
+      upsert.mockImplementation(async (input) => {
+        Object.assign(session, input);
+        return session;
+      });
+      let tokenBody: URLSearchParams | undefined;
+      vi.mocked(fetch).mockImplementation(async (url, init) => {
+        const value = String(url);
+        if (value === "https://mcp.example.com/token") {
+          tokenBody = init?.body as URLSearchParams;
+          return jsonResponse(200, {
+            access_token: "access-token",
+            token_type: "Bearer",
+          });
+        }
+        throw new Error(`unexpected fetch in test: ${value}`);
+      });
 
-    const result = await oauthImplementations.startAuthorization(
-      { mcp_server_uuid: SERVER_UUID },
-      USER_ID,
-    );
+      const result = await oauthImplementations.startAuthorization(
+        { mcp_server_uuid: SERVER_UUID },
+        USER_ID,
+      );
 
-    expect(result.success).toBe(true);
-    if (!result.success) throw new Error("unreachable");
-    const authorizationUrl = new URL(result.data.authorization_url);
-    expect(authorizationUrl.searchParams.get("client_id")).toBe(
-      "manual-client",
-    );
-    expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(metadataUrl);
-    expect(saveDynamicClientInformation).not.toHaveBeenCalled();
-  });
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error("unreachable");
+      const authorizationUrl = new URL(result.data.authorization_url);
+      expect(authorizationUrl.searchParams.get("client_id")).toBe(
+        `${registrationKind}-client`,
+      );
+      expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(
+        persistedRedirect,
+      );
+      expect(saveDynamicClientInformation).not.toHaveBeenCalled();
+      const state = authorizationUrl.searchParams.get("state");
+      if (!state) throw new Error("state missing");
+
+      const exchanged = await oauthImplementations.exchangeToken(
+        { code: "authorization-code", state },
+        USER_ID,
+      );
+
+      expect(exchanged.success).toBe(true);
+      expect(tokenBody?.get("client_id")).toBe(`${registrationKind}-client`);
+      expect(tokenBody?.get("redirect_uri")).toBe(persistedRedirect);
+    },
+  );
 
   it("disables CIMD for a redirect override and retains DCR behavior", async () => {
     process.env.OAUTH_CLIENT_METADATA_URL =
