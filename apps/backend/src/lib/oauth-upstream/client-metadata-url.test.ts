@@ -16,9 +16,24 @@ describe("resolveOAuthClientMetadataUrl", () => {
   });
 
   it("returns a valid HTTPS metadata URL byte-for-byte", () => {
-    const value = "https://oauth.example:443/oauth/client-metadata";
+    const value = "https://oauth.example:8443/oauth/client-metadata";
     process.env.OAUTH_CLIENT_METADATA_URL = value;
     expect(resolveOAuthClientMetadataUrl()).toBe(value);
+  });
+
+  it.each([
+    "https:oauth.example/oauth/client-metadata",
+    " https://oauth.example/oauth/client-metadata",
+    "https://oauth.example/oauth/client-metadata ",
+    "https://oauth.\nexample/oauth/client-metadata",
+    "HTTPS://oauth.example/oauth/client-metadata",
+    "https://OAUTH.EXAMPLE/oauth/client-metadata",
+    "https://oauth.example:443/oauth/client-metadata",
+  ])("rejects noncanonical raw metadata URL %j", (value) => {
+    process.env.OAUTH_CLIENT_METADATA_URL = value;
+    expect(() => resolveOAuthClientMetadataUrl()).toThrow(
+      /OAUTH_CLIENT_METADATA_URL/,
+    );
   });
 
   it("rejects a metadata URL whose pathname is not the gateway route", () => {

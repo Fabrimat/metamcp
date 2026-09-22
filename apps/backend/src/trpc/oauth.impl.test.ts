@@ -2168,7 +2168,7 @@ describe("oauthImplementations.startAuthorization", () => {
   });
 
   it("sends the persisted CIMD client ID and redirect URI byte-identically at token exchange", async () => {
-    const metadataUrl = "https://oauth.example:443/oauth/client-metadata";
+    const metadataUrl = "https://oauth.example:8443/oauth/client-metadata";
     process.env.OAUTH_CLIENT_METADATA_URL = metadataUrl;
     const {
       oauthImplementations,

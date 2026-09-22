@@ -4,6 +4,16 @@ export function resolveOAuthClientMetadataUrl(
   const value = env.OAUTH_CLIENT_METADATA_URL;
   if (value === undefined) return undefined;
 
+  if (
+    !value.startsWith("https://") ||
+    value.trim() !== value ||
+    /\p{Cc}/u.test(value)
+  ) {
+    throw new Error(
+      "OAUTH_CLIENT_METADATA_URL must be a canonical HTTPS URL with no whitespace or control characters",
+    );
+  }
+
   let url: URL;
   try {
     url = new URL(value);
@@ -21,6 +31,7 @@ export function resolveOAuthClientMetadataUrl(
   if (
     value.length === 0 ||
     url.protocol !== "https:" ||
+    url.href !== value ||
     url.pathname !== "/oauth/client-metadata" ||
     rawPath !== "/oauth/client-metadata" ||
     url.username !== "" ||
