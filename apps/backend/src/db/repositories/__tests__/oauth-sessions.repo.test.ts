@@ -6,7 +6,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 type Predicate =
   | { type: "eq"; field: string; value: unknown }
-  | { type: "and"; predicates: Predicate[] };
+  | { type: "and"; predicates: Predicate[] }
+  | { type: "sql"; text: string };
 
 const valuesCalls: any[] = [];
 const onConflictSetCalls: any[] = [];
@@ -19,10 +20,16 @@ const keyFor = (mcpServerUuid: string, userId: string) =>
 const matches = (
   row: Record<string, unknown>,
   predicate: Predicate,
-): boolean =>
-  predicate.type === "eq"
-    ? row[predicate.field] === predicate.value
-    : predicate.predicates.every((part) => matches(row, part));
+): boolean => {
+  if (predicate.type === "eq") return row[predicate.field] === predicate.value;
+  if (predicate.type === "and")
+    return predicate.predicates.every((part) => matches(row, part));
+  if (predicate.text.includes("_metamcp_registration")) {
+    const client = row.client_information as Record<string, unknown> | null;
+    return client?._metamcp_registration !== "legacy_unconfirmed";
+  }
+  return true;
+};
 
 vi.mock("drizzle-orm", () => ({
   and: (...predicates: Predicate[]): Predicate => ({ type: "and", predicates }),
@@ -31,7 +38,10 @@ vi.mock("drizzle-orm", () => ({
     field: column.name,
     value,
   }),
-  sql: (strings: TemplateStringsArray) => ({ sql: strings.join("") }),
+  sql: (strings: TemplateStringsArray) => ({
+    type: "sql",
+    text: strings.join(""),
+  }),
 }));
 
 vi.mock("../../index", () => ({
@@ -57,9 +67,11 @@ vi.mock("../../index", () => ({
           onConflictDoUpdate: ({
             target,
             set,
+            setWhere,
           }: {
             target: unknown;
             set: any;
+            setWhere?: Predicate;
           }) => {
             onConflictTargetCalls.push(target);
             onConflictSetCalls.push(set);
@@ -69,6 +81,7 @@ vi.mock("../../index", () => ({
                 const now = new Date();
                 const existing = store.get(key);
                 if (existing) {
+                  if (setWhere && !matches(existing, setWhere)) return [];
                   const { updated_at: _ignored, ...applicable } = set;
                   const updated = {
                     ...existing,
@@ -173,7 +186,10 @@ describe("OAuthSessionsRepository", () => {
     await repo.upsert({
       mcp_server_uuid: serverId,
       user_id: userB,
-      client_information: { client_id: "dynamic" },
+      client_information: {
+        client_id: "dynamic",
+        _metamcp_registration: "dynamic",
+      },
       tokens: tokensB,
       code_verifier: "B",
       expected_state: "state-B",
@@ -208,6 +224,113 @@ describe("OAuthSessionsRepository", () => {
     expect(
       (await repo.findByMcpServerAndUser("other-server", userA))?.tokens,
     ).toEqual(tokensA);
+  });
+
+  it("quarantines ambiguous legacy client credentials instead of deleting them", async () => {
+    const legacy = {
+      client_id: "legacy-client",
+      client_secret: "legacy-secret",
+      token_endpoint_auth_method: "client_secret_post",
+      redirect_uris: ["https://old.example/callback"],
+    };
+    await repo.upsert({
+      mcp_server_uuid: serverId,
+      user_id: userA,
+      client_information: legacy,
+      tokens: tokensA,
+      code_verifier: "verifier",
+      expected_state: "state",
+      discovery_state: { authorizationServerUrl: "https://stale.example" },
+    });
+    const otherUsersLegacyClient = {
+      client_id: "legacy-client-id-only",
+      redirect_uris: ["https://old.example/callback"],
+    };
+    await repo.upsert({
+      mcp_server_uuid: serverId,
+      user_id: userB,
+      client_information: otherUsersLegacyClient,
+      tokens: tokensB,
+      code_verifier: "other-verifier",
+      expected_state: "other-state",
+      discovery_state: {
+        authorizationServerUrl: "https://other-stale.example",
+      },
+    });
+
+    await repo.invalidateRedirectDependentSessions(
+      serverId,
+      "https://new.example/callback",
+    );
+
+    expect(await repo.findByMcpServerAndUser(serverId, userA)).toMatchObject({
+      client_information: {
+        ...legacy,
+        _metamcp_registration: "legacy_unconfirmed",
+      },
+      tokens: null,
+      code_verifier: null,
+      expected_state: null,
+      discovery_state: null,
+    });
+    expect(await repo.findByMcpServerAndUser(serverId, userB)).toMatchObject({
+      client_information: {
+        ...otherUsersLegacyClient,
+        _metamcp_registration: "legacy_unconfirmed",
+      },
+      tokens: null,
+      code_verifier: null,
+      expected_state: null,
+      discovery_state: null,
+    });
+  });
+
+  it("deletes explicitly dynamic registration during redirect invalidation", async () => {
+    await repo.upsert({
+      mcp_server_uuid: serverId,
+      user_id: userA,
+      client_information: {
+        client_id: "dynamic-client",
+        client_secret: "dynamic-secret",
+        _metamcp_registration: "dynamic",
+      },
+    });
+
+    await repo.invalidateRedirectDependentSessions(
+      serverId,
+      "https://new.example/callback",
+    );
+
+    expect(
+      (await repo.findByMcpServerAndUser(serverId, userA))?.client_information,
+    ).toEqual({});
+  });
+
+  it("preserves an unmarked legacy client with explicit endpoints", async () => {
+    const legacyManual = {
+      client_id: "legacy-manual",
+      client_secret: "secret",
+      authorization_endpoint: "https://as.example/authorize",
+      token_endpoint: "https://as.example/token",
+      redirect_uris: ["https://old.example/callback"],
+    };
+    await repo.upsert({
+      mcp_server_uuid: serverId,
+      user_id: userA,
+      client_information: legacyManual,
+    });
+
+    await repo.invalidateRedirectDependentSessions(
+      serverId,
+      "https://new.example/callback",
+    );
+
+    expect(
+      (await repo.findByMcpServerAndUser(serverId, userA))?.client_information,
+    ).toEqual({
+      ...legacyManual,
+      redirect_uris: ["https://new.example/callback"],
+    });
   });
   const repo = new OAuthSessionsRepository();
   const serverId = "00000000-0000-0000-0000-000000000001";
@@ -418,5 +541,28 @@ describe("OAuthSessionsRepository", () => {
     expect(second.tokens).toEqual(tokensA);
     expect(second.expected_state).toBe("state-A");
     expect(second.code_verifier).toBe("the-verifier");
+  });
+
+  it("atomically refuses to overwrite quarantine with a late DCR result", async () => {
+    const quarantined = {
+      client_id: "legacy-client",
+      client_secret: "legacy-secret",
+      _metamcp_registration: "legacy_unconfirmed",
+    };
+    await repo.upsert({
+      mcp_server_uuid: serverId,
+      user_id: userA,
+      client_information: quarantined,
+    });
+
+    const saved = await repo.saveDynamicClientInformation(serverId, userA, {
+      client_id: "late-dcr-client",
+      _metamcp_registration: "dynamic",
+    } as unknown as OAuthClientInformation);
+
+    expect(saved).toBe(false);
+    expect(
+      (await repo.findByMcpServerAndUser(serverId, userA))?.client_information,
+    ).toEqual(quarantined);
   });
 });

@@ -8,6 +8,7 @@ vi.mock("../../db/repositories", () => ({
   oauthSessionsRepository: {
     findByMcpServerAndUser: vi.fn(),
     upsert: vi.fn(),
+    saveDynamicClientInformation: vi.fn(),
   },
 }));
 
@@ -30,6 +31,9 @@ describe("OAuthUpstreamClientProvider user-scoped persistence", () => {
   const load = async () => {
     const repositories = await import("../../db/repositories");
     const { OAuthUpstreamClientProvider } = await import("./provider");
+    const saveDynamicClientInformation = repositories.oauthSessionsRepository
+      .saveDynamicClientInformation as ReturnType<typeof vi.fn>;
+    saveDynamicClientInformation.mockResolvedValue(true);
     return {
       provider: new OAuthUpstreamClientProvider({
         mcpServerUuid: SERVER,
@@ -42,18 +46,59 @@ describe("OAuthUpstreamClientProvider user-scoped persistence", () => {
       upsert: repositories.oauthSessionsRepository.upsert as ReturnType<
         typeof vi.fn
       >,
+      saveDynamicClientInformation,
     };
   };
 
   it("loads client information with the composite server and user key", async () => {
     const { provider, findByMcpServerAndUser } = await load();
-    findByMcpServerAndUser.mockResolvedValue({
+    findByMcpServerAndUser.mockResolvedValueOnce({
       client_information: { client_id: "caller-client" },
     });
     await expect(provider.clientInformation()).resolves.toMatchObject({
       client_id: "caller-client",
     });
     expect(findByMcpServerAndUser).toHaveBeenCalledWith(SERVER, USER);
+  });
+
+  it("does not expose quarantined legacy client information to the SDK", async () => {
+    const { provider, findByMcpServerAndUser } = await load();
+    findByMcpServerAndUser.mockResolvedValueOnce({
+      client_information: {
+        client_id: "legacy-client",
+        client_secret: "legacy-secret",
+        _metamcp_registration: "legacy_unconfirmed",
+      },
+    });
+
+    await expect(provider.clientInformation()).resolves.toBeUndefined();
+  });
+
+  it("does not derive or reuse discovery for quarantined legacy clients", async () => {
+    const { provider, findByMcpServerAndUser } = await load();
+    findByMcpServerAndUser.mockResolvedValue({
+      client_information: {
+        client_id: "legacy-client",
+        authorization_endpoint: "https://configured.example/authorize",
+        token_endpoint: "https://configured.example/token",
+        _metamcp_registration: "legacy_unconfirmed",
+      },
+      discovery_state: { authorizationServerUrl: "https://stale.example" },
+    });
+
+    await expect(provider.discoveryState()).resolves.toBeUndefined();
+  });
+
+  it("fails closed when redirect invalidation quarantines during DCR", async () => {
+    const { provider, saveDynamicClientInformation, upsert } = await load();
+    saveDynamicClientInformation.mockResolvedValue(false);
+
+    await expect(
+      provider.saveClientInformation({ client_id: "late-dcr-client" }),
+    ).rejects.toMatchObject({
+      code: "oauth_client_confirmation_required",
+    });
+    expect(upsert).not.toHaveBeenCalled();
   });
 
   it("writes verifier state with the caller user id", async () => {

@@ -38,6 +38,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { useTranslations } from "@/hooks/useTranslations";
+import { oauthCreatePayload } from "@/lib/oauth-form";
 import { trpc } from "@/lib/trpc";
 import { createTranslatedZodResolver } from "@/lib/zod-resolver";
 
@@ -158,35 +159,7 @@ export default function McpServersPage() {
       }
     }
 
-    // Only attach the pre-registered OAuth payload for HTTP-style servers,
-    // and only when the user actually filled in client_id and/or
-    // redirect_uri. redirect_uri alone (no client_id) is a valid
-    // configuration — an upstream that supports RFC 7591 dynamic client
-    // registration but only accepts a loopback redirect_uri (e.g.
-    // Reclaim.ai) needs just the override, not a pre-registered client.
-    const isHttpServer =
-      data.type === McpServerTypeEnum.enum.SSE ||
-      data.type === McpServerTypeEnum.enum.STREAMABLE_HTTP;
-    const hasOauthClientId = Boolean(
-      data.oauth_client_id && data.oauth_client_id.trim() !== "",
-    );
-    const hasOauthRedirectUri = Boolean(
-      data.oauth_redirect_uri && data.oauth_redirect_uri.trim() !== "",
-    );
-    const oauthClientInfo =
-      isHttpServer && (hasOauthClientId || hasOauthRedirectUri)
-        ? {
-            client_id: data.oauth_client_id?.trim() || undefined,
-            client_secret: data.oauth_client_secret || undefined,
-            authorization_endpoint:
-              data.oauth_authorization_endpoint || undefined,
-            token_endpoint: data.oauth_token_endpoint || undefined,
-            scope: data.oauth_scope || undefined,
-            token_endpoint_auth_method:
-              data.oauth_token_endpoint_auth_method || "none",
-            redirect_uri: data.oauth_redirect_uri?.trim() || undefined,
-          }
-        : undefined;
+    const oauthClientInfo = oauthCreatePayload(data);
 
     const request: CreateMcpServerRequest = {
       name: data.name,

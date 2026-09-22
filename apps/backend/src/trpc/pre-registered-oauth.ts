@@ -107,6 +107,7 @@ export async function persistPreRegisteredOAuthClient(
     redirectChanged &&
     previousClient?.client_id === clientInfo.client_id &&
     !isManualOAuthClient(previousClient) &&
+    !oauth.confirm_client_information &&
     !oauth.authorization_endpoint &&
     !oauth.token_endpoint &&
     !oauth.client_secret

@@ -12,6 +12,7 @@ vi.mock("../db/repositories", () => ({
   oauthSessionsRepository: {
     findByMcpServerAndUser: vi.fn(),
     upsert: vi.fn(),
+    saveDynamicClientInformation: vi.fn(),
     compareAndSetExpectedState: vi.fn(),
   },
   mcpServersRepository: {
@@ -1702,9 +1703,13 @@ describe("exchangeToken state CSRF validation", () => {
 // exercises OAuthUpstreamClientProvider (provider.ts) end to end through
 // the SDK's actual discovery/DCR/PKCE/state code paths.
 describe("oauthImplementations.startAuthorization", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     process.env.APP_URL = "https://metamcp.example.com";
     vi.clearAllMocks();
+    const { oauthSessionsRepository } = await import("../db/repositories");
+    vi.mocked(
+      oauthSessionsRepository.saveDynamicClientInformation,
+    ).mockResolvedValue(true);
     vi.spyOn(globalThis, "fetch").mockImplementation(
       async () => new Response("No resource metadata", { status: 404 }),
     );
@@ -1722,6 +1727,8 @@ describe("oauthImplementations.startAuthorization", () => {
       findByMcpServerAndUser: repos.oauthSessionsRepository
         .findByMcpServerAndUser as ReturnType<typeof vi.fn>,
       upsert: repos.oauthSessionsRepository.upsert as ReturnType<typeof vi.fn>,
+      saveDynamicClientInformation: repos.oauthSessionsRepository
+        .saveDynamicClientInformation as ReturnType<typeof vi.fn>,
       findServerByUuid: repos.mcpServersRepository.findByUuid as ReturnType<
         typeof vi.fn
       >,
@@ -1790,6 +1797,81 @@ describe("oauthImplementations.startAuthorization", () => {
     ).not.toContain("fixture_value");
   });
 
+  it("requires confirmation for quarantined legacy credentials before SDK authorization", async () => {
+    const {
+      oauthImplementations,
+      findByMcpServerAndUser,
+      upsert,
+      findServerByUuid,
+    } = await loadModule();
+    findServerByUuid.mockResolvedValue(ownedServer(SERVER_UUID, SERVER_URL));
+    findByMcpServerAndUser.mockResolvedValue({
+      mcp_server_uuid: SERVER_UUID,
+      client_information: {
+        client_id: "legacy-client",
+        client_secret: "legacy-secret",
+        _metamcp_registration: "legacy_unconfirmed",
+      },
+      discovery_state: null,
+    });
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const result = await oauthImplementations.startAuthorization(
+      { mcp_server_uuid: SERVER_UUID },
+      USER_ID,
+    );
+
+    expect(result).toEqual({
+      success: false,
+      error: "oauth_client_confirmation_required",
+      error_description:
+        "Confirm the saved OAuth client configuration before authorizing.",
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(upsert).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
+  });
+
+  it("returns confirmation-required when quarantine wins the DCR persistence race", async () => {
+    const { oauthImplementations, findByMcpServerAndUser, findServerByUuid } =
+      await loadModule();
+    const { oauthSessionsRepository } = await import("../db/repositories");
+    findServerByUuid.mockResolvedValue(ownedServer(SERVER_UUID, SERVER_URL));
+    findByMcpServerAndUser.mockResolvedValue(undefined);
+    vi.mocked(
+      oauthSessionsRepository.saveDynamicClientInformation,
+    ).mockResolvedValue(false);
+    vi.mocked(fetch).mockImplementation(async (url) => {
+      if (String(url).includes("oauth-authorization-server"))
+        return jsonResponse(200, {
+          issuer: "https://mcp.example.com",
+          authorization_endpoint: "https://mcp.example.com/authorize",
+          token_endpoint: "https://mcp.example.com/token",
+          registration_endpoint: "https://mcp.example.com/register",
+          response_types_supported: ["code"],
+        });
+      if (String(url).endsWith("/register"))
+        return jsonResponse(201, {
+          client_id: "late-dcr-client",
+          redirect_uris: ["https://metamcp.example.com/fe-oauth/callback"],
+          token_endpoint_auth_method: "none",
+          grant_types: ["authorization_code", "refresh_token"],
+          response_types: ["code"],
+        });
+      return new Response("not found", { status: 404 });
+    });
+
+    await expect(
+      oauthImplementations.startAuthorization(
+        { mcp_server_uuid: SERVER_UUID },
+        USER_ID,
+      ),
+    ).resolves.toMatchObject({
+      success: false,
+      error: "oauth_client_confirmation_required",
+    });
+  });
+
   it("returns access_denied when a different user owns the server (same ownership gate as exchangeToken/refreshToken)", async () => {
     const { oauthImplementations, findServerByUuid } = await loadModule();
     findServerByUuid.mockResolvedValue(
@@ -1823,6 +1905,7 @@ describe("oauthImplementations.startAuthorization", () => {
       oauthImplementations,
       findByMcpServerAndUser,
       upsert,
+      saveDynamicClientInformation,
       findServerByUuid,
     } = await loadModule();
 
@@ -1892,12 +1975,10 @@ describe("oauthImplementations.startAuthorization", () => {
     // Find the upsert call that persisted client_information and assert
     // the CRITICAL invariant: redirect_uris[0] is the override, NOT the
     // upstream's mismatched echo.
-    const clientInfoCall = upsert.mock.calls.find(
-      (call) => call[0]?.client_information,
-    );
+    const clientInfoCall = saveDynamicClientInformation.mock.calls[0];
     expect(clientInfoCall).toBeDefined();
     if (!clientInfoCall) throw new Error("unreachable");
-    const persistedClientInfo = clientInfoCall[0].client_information;
+    const persistedClientInfo = clientInfoCall[2];
     expect(persistedClientInfo.redirect_uris).toEqual([REDIRECT_OVERRIDE]);
     expect(persistedClientInfo.client_id).toBe("dcr-client-xyz");
 

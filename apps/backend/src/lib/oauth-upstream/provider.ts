@@ -34,6 +34,10 @@ import {
 import { oauthSessionsRepository } from "../../db/repositories";
 import { resolveRedirectUri } from "../../trpc/pre-registered-oauth";
 import logger from "../../utils/logger";
+import {
+  isQuarantinedOAuthClient,
+  OAuthClientConfirmationRequiredError,
+} from "./client-registration";
 import { createUpstreamState } from "./state";
 import { redactToken } from "./token-exchange";
 
@@ -63,6 +67,7 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
   // that method. The tRPC handler (oauth.impl.ts) reads this after
   // `auth()` resolves with 'REDIRECT'.
   authorizationUrl: URL | undefined;
+  clientConfirmationRequired = false;
 
   constructor(options: OAuthUpstreamClientProviderOptions) {
     this.mcpServerUuid = options.mcpServerUuid;
@@ -98,7 +103,8 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
   async clientInformation(): Promise<OAuthClientInformationMixed | undefined> {
     const session = await this.loadSession();
     const ci = clientInfoAsRecord(session?.client_information);
-    if (!ci || typeof ci.client_id !== "string") return undefined;
+    if (!ci || isQuarantinedOAuthClient(ci) || typeof ci.client_id !== "string")
+      return undefined;
     return ci as unknown as OAuthClientInformationMixed;
   }
 
@@ -119,11 +125,15 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
       _metamcp_registration: "dynamic",
       redirect_uris: [this.redirectUrl],
     };
-    await oauthSessionsRepository.upsert({
-      mcp_server_uuid: this.mcpServerUuid,
-      user_id: this.userId,
-      client_information: patched as unknown as OAuthClientInformation,
-    });
+    const saved = await oauthSessionsRepository.saveDynamicClientInformation(
+      this.mcpServerUuid,
+      this.userId,
+      patched as unknown as OAuthClientInformation,
+    );
+    if (!saved) {
+      this.clientConfirmationRequired = true;
+      throw new OAuthClientConfirmationRequiredError();
+    }
     logger.info(
       `[oauth] DCR registered client — server=${this.mcpServerUuid} ` +
         `client_id=${clientInformation.client_id} ` +
@@ -214,6 +224,7 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
   async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
     const session = await this.loadSession();
     const ci = clientInfoAsRecord(session?.client_information);
+    if (isQuarantinedOAuthClient(ci)) return undefined;
     const authorizationEndpoint =
       typeof ci?.authorization_endpoint === "string"
         ? ci.authorization_endpoint

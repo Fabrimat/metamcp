@@ -45,6 +45,18 @@ describe("buildPreRegisteredClientInformation", () => {
     });
   });
 
+  it("does not persist the explicit-confirmation transport flag", () => {
+    const result = buildPreRegisteredClientInformation(
+      {
+        client_id: "confirmed-client",
+        confirm_client_information: true,
+      },
+      REDIRECT_URI,
+    );
+
+    expect(result).not.toHaveProperty("confirm_client_information");
+  });
+
   it("includes the secret, endpoints, and scope when supplied", () => {
     const result = buildPreRegisteredClientInformation(
       {
@@ -488,5 +500,52 @@ describe("persistPreRegisteredOAuthClient", () => {
     );
 
     expect(stored).toBeUndefined();
+  });
+
+  it("promotes client-id-only legacy information when the user explicitly confirms it", async () => {
+    let stored: Record<string, unknown> | undefined = {
+      mcp_server_uuid: SERVER_UUID,
+      client_information: {
+        client_id: "legacy-client-id",
+        redirect_uris: ["http://127.0.0.1:4000/callback"],
+      },
+      tokens: { access_token: "old-token" },
+    };
+
+    const statefulRepo = {
+      findByMcpServerAndUser: vi.fn(async () => stored),
+      upsert: vi.fn(async (input: Record<string, unknown>) => {
+        stored = { ...stored, ...input };
+        return stored;
+      }),
+      deleteByMcpServerAndUser: vi.fn(async () => {
+        const deleted = stored;
+        stored = undefined;
+        return deleted;
+      }),
+      invalidateRedirectDependentSessions: vi.fn(async () => {
+        stored = undefined;
+      }),
+    } as unknown as OAuthSessionsRepository;
+
+    await persistPreRegisteredOAuthClient(
+      SERVER_UUID,
+      USER_ID,
+      {
+        client_id: "legacy-client-id",
+        redirect_uri: "http://127.0.0.1:5000/callback",
+        confirm_client_information: true,
+      },
+      statefulRepo,
+      "http://127.0.0.1:4000/callback",
+    );
+
+    expect(stored).toMatchObject({
+      client_information: {
+        _metamcp_registration: "manual",
+        client_id: "legacy-client-id",
+        redirect_uris: ["http://127.0.0.1:5000/callback"],
+      },
+    });
   });
 });

@@ -1,7 +1,7 @@
 import { createServerFormSchema, EditServerFormSchema } from "@repo/zod-types";
 import { describe, expect, it } from "vitest";
 
-import { oauthEditPayload } from "./oauth-form";
+import { oauthCreatePayload, oauthEditPayload } from "./oauth-form";
 
 describe("OAuth form submissions", () => {
   it("submits only the redirect when editing a prefilled client", () => {
@@ -43,6 +43,7 @@ describe("OAuth form submissions", () => {
         { oauth_scope: true },
       ),
     ).toMatchObject({
+      confirm_client_information: true,
       client_id: "manual",
       client_secret: "secret",
       authorization_endpoint: "https://as.example/authorize",
@@ -55,8 +56,29 @@ describe("OAuth form submissions", () => {
       oauthEditPayload(
         { type: "SSE", oauth_client_id: "" },
         { oauth_client_id: true },
-      )?.client_id,
-    ).toBe("");
+      ),
+    ).toMatchObject({ client_id: "", confirm_client_information: true });
+  });
+  it("confirms a client id entered while creating an HTTP server", () => {
+    expect(
+      oauthCreatePayload({
+        type: "SSE",
+        oauth_client_id: " manual-client ",
+      }),
+    ).toMatchObject({
+      client_id: "manual-client",
+      confirm_client_information: true,
+    });
+  });
+  it("does not claim confirmation for a redirect-only create", () => {
+    expect(
+      oauthCreatePayload({
+        type: "STREAMABLE_HTTP",
+        oauth_redirect_uri: "http://localhost/callback",
+      }),
+    ).toEqual({
+      redirect_uri: "http://localhost/callback",
+    });
   });
   it.each([createServerFormSchema, EditServerFormSchema])(
     "accepts redirect-only HTTP form data",

@@ -24,6 +24,10 @@ import {
   oauthSessionsRepository,
 } from "../db/repositories";
 import { OAuthSessionsSerializer } from "../db/serializers";
+import {
+  isQuarantinedOAuthClient,
+  OAuthClientConfirmationRequiredError,
+} from "../lib/oauth-upstream/client-registration";
 import { OAuthUpstreamClientProvider } from "../lib/oauth-upstream/provider";
 import { tryRefreshUpstreamTokens } from "../lib/oauth-upstream/refresh-on-401";
 import { parseUpstreamState } from "../lib/oauth-upstream/state";
@@ -550,6 +554,14 @@ export const oauthImplementations = {
       userId,
     );
     const clientInformation = clientInfoAsRecord(session?.client_information);
+    if (isQuarantinedOAuthClient(clientInformation)) {
+      return {
+        success: false as const,
+        error: "oauth_client_confirmation_required",
+        error_description:
+          "Confirm the saved OAuth client configuration before authorizing.",
+      };
+    }
     const scope =
       typeof clientInformation?.scope === "string" &&
       clientInformation.scope.length > 0
@@ -612,6 +624,20 @@ export const oauthImplementations = {
         message: "Authorization URL created",
       };
     } catch (error) {
+      if (
+        provider.clientConfirmationRequired ||
+        error instanceof OAuthClientConfirmationRequiredError ||
+        (error instanceof Error &&
+          "code" in error &&
+          error.code === "oauth_client_confirmation_required")
+      ) {
+        return {
+          success: false as const,
+          error: "oauth_client_confirmation_required",
+          error_description:
+            "Confirm the saved OAuth client configuration before authorizing.",
+        };
+      }
       // SDK error messages can include raw response bodies and credentials.
       const allowedCodes = new Set([
         "invalid_client",

@@ -130,6 +130,11 @@ export const OAuthClientAuthMethodEnum = z.enum([
 // dynamic registration and goes straight to the authorization-code-with-PKCE
 // flow against the provider's authorization endpoint.
 const oauthClientInfoBaseSchema = z.object({
+  // One-shot transport signal: the user intentionally edited the manual
+  // client fields and confirms that the submitted client information may be
+  // promoted from a quarantined/legacy registration. The backend must never
+  // persist this flag inside oauth_sessions.client_information.
+  confirm_client_information: z.boolean().optional(),
   client_id: z.string().optional(),
   client_secret: z.string().optional(),
   authorization_endpoint: z.string().optional(),

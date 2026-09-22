@@ -1,3 +1,4 @@
+import { OAuthClientInformation } from "@modelcontextprotocol/sdk/shared/auth.js";
 import {
   DatabaseOAuthSession,
   OAuthSessionCreateInput,
@@ -5,11 +6,39 @@ import {
 } from "@repo/zod-types";
 import { and, eq, sql } from "drizzle-orm";
 
-import { isManualOAuthClient } from "../../lib/oauth-upstream/client-registration";
+import { classifyOAuthClientRegistration } from "../../lib/oauth-upstream/client-registration";
 import { db } from "../index";
 import { oauthSessionsTable } from "../schema";
 
 export class OAuthSessionsRepository {
+  async saveDynamicClientInformation(
+    mcpServerUuid: string,
+    userId: string,
+    clientInformation: OAuthClientInformation,
+  ): Promise<boolean> {
+    const [row] = await db
+      .insert(oauthSessionsTable)
+      .values({
+        mcp_server_uuid: mcpServerUuid,
+        user_id: userId,
+        client_information: clientInformation,
+      })
+      .onConflictDoUpdate({
+        target: [
+          oauthSessionsTable.mcp_server_uuid,
+          oauthSessionsTable.user_id,
+        ],
+        set: {
+          client_information: clientInformation,
+          updated_at: sql`NOW()`,
+        },
+        setWhere: sql`${oauthSessionsTable.client_information}->>'_metamcp_registration' IS DISTINCT FROM 'legacy_unconfirmed'`,
+      })
+      .returning();
+
+    return Boolean(row);
+  }
+
   async invalidateRedirectDependentSessions(
     mcpServerUuid: string,
     redirectUri: string,
@@ -23,15 +52,18 @@ export class OAuthSessionsRepository {
         string,
         unknown
       > | null;
+      const registrationKind = classifyOAuthClientRegistration(client);
+      const invalidatedClient =
+        registrationKind === "manual"
+          ? { ...client, redirect_uris: [redirectUri] }
+          : registrationKind === "legacy_unconfirmed"
+            ? { ...client, _metamcp_registration: "legacy_unconfirmed" }
+            : {};
       await db
         .update(oauthSessionsTable)
         .set({
-          client_information: isManualOAuthClient(client)
-            ? ({
-                ...client,
-                redirect_uris: [redirectUri],
-              } as unknown as typeof session.client_information)
-            : ({} as typeof session.client_information),
+          client_information:
+            invalidatedClient as typeof session.client_information,
           tokens: null,
           code_verifier: null,
           expected_state: null,
