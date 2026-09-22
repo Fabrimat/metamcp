@@ -35,7 +35,11 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { useConnection } from "@/hooks/useConnection";
 import { useTranslations } from "@/hooks/useTranslations";
-import { beginUpstreamAuthorization } from "@/lib/oauth-authorization";
+import {
+  beginUpstreamAuthorization,
+  OAuthAuthorizationError,
+} from "@/lib/oauth-authorization";
+import { getReclaimOAuthGuide } from "@/lib/reclaim-oauth-guide";
 import { trpc } from "@/lib/trpc";
 
 import { ToolManagement } from "./components/tool-management";
@@ -64,6 +68,10 @@ export default function McpServerDetailPage({
     useState<boolean>(false);
   const [showDeleteDialog, setShowDeleteDialog] = useState<boolean>(false);
   const [editDialogOpen, setEditDialogOpen] = useState<boolean>(false);
+  const [reclaimOAuthGuide, setReclaimOAuthGuide] = useState<{
+    redirectUri: string;
+    tunnelCommand: string;
+  } | null>(null);
 
   // Function to toggle env var visibility
   const toggleEnvVarVisibility = (key: string) => {
@@ -150,6 +158,7 @@ export default function McpServerDetailPage({
     trpc.frontend.oauth.startAuthorization.useMutation();
 
   const handleAuthorize = async () => {
+    setReclaimOAuthGuide(null);
     try {
       await beginUpstreamAuthorization(
         uuid,
@@ -157,6 +166,15 @@ export default function McpServerDetailPage({
         (authorizationUrl) => window.location.assign(authorizationUrl),
       );
     } catch (error) {
+      const guide = getReclaimOAuthGuide({
+        serverUrl: server?.url ?? "",
+        errorCode:
+          error instanceof OAuthAuthorizationError ? error.code : undefined,
+      });
+      if (guide) {
+        setReclaimOAuthGuide(guide);
+        return;
+      }
       toast.error(t("mcp-servers:detail.authorizeFailed"), {
         description: error instanceof Error ? error.message : undefined,
       });
@@ -509,6 +527,37 @@ export default function McpServerDetailPage({
             )}
           </div>
         </div>
+
+        {reclaimOAuthGuide && (
+          <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm">
+            <p className="font-medium">
+              {t("mcp-servers:detail.reclaimOauthTitle")}
+            </p>
+            <ol className="mt-2 list-decimal space-y-2 pl-5 text-muted-foreground">
+              <li>
+                {t("mcp-servers:detail.reclaimOauthSetRedirect")}{" "}
+                <code className="text-foreground">
+                  {reclaimOAuthGuide.redirectUri}
+                </code>
+              </li>
+              <li>
+                {t("mcp-servers:detail.reclaimOauthStartTunnel")}{" "}
+                <code className="text-foreground">
+                  {reclaimOAuthGuide.tunnelCommand}
+                </code>
+              </li>
+              <li>{t("mcp-servers:detail.reclaimOauthRetry")}</li>
+            </ol>
+            <Button
+              className="mt-3"
+              size="sm"
+              variant="outline"
+              onClick={() => setEditDialogOpen(true)}
+            >
+              {t("mcp-servers:detail.reclaimOauthEdit")}
+            </Button>
+          </div>
+        )}
 
         {/* Server Details */}
         {server ? (
