@@ -72,6 +72,30 @@ function isSafeErrorCode(value: string): boolean {
   );
 }
 
+function isSafeIssuer(value: string): boolean {
+  if (
+    !isSafeOpaqueValue(value, 2048) ||
+    !/^https:\/\//i.test(value) ||
+    value !== value.trim() ||
+    value.includes("?") ||
+    value.includes("#")
+  ) {
+    return false;
+  }
+  try {
+    const issuer = new URL(value);
+    return (
+      issuer.protocol === "https:" &&
+      !issuer.username &&
+      !issuer.password &&
+      !issuer.search &&
+      !issuer.hash
+    );
+  } catch {
+    return false;
+  }
+}
+
 function resolvePrivateCallbackUrl(env: NodeJS.ProcessEnv): URL | null {
   const appUrl = env.APP_URL;
   if (!appUrl) return null;
@@ -103,10 +127,11 @@ function parseCallback(requestUrl: string, url: URL): URLSearchParams | null {
   const stateValues = url.searchParams.getAll("state");
   const errorValues = url.searchParams.getAll("error");
   const descriptionValues = url.searchParams.getAll("error_description");
+  const issuerValues = url.searchParams.getAll("iss");
   const allowed =
     codeValues.length > 0
-      ? new Set(["code", "state"])
-      : new Set(["error", "error_description", "state"]);
+      ? new Set(["code", "state", "iss"])
+      : new Set(["error", "error_description", "state", "iss"]);
 
   if (
     keys.some((key) => !allowed.has(key)) ||
@@ -114,6 +139,7 @@ function parseCallback(requestUrl: string, url: URL): URLSearchParams | null {
     codeValues.length > 1 ||
     errorValues.length > 1 ||
     descriptionValues.length > 1 ||
+    issuerValues.length > 1 ||
     (codeValues.length === 1) === (errorValues.length === 1)
   ) {
     return null;
@@ -143,6 +169,11 @@ function parseCallback(requestUrl: string, url: URL): URLSearchParams | null {
     }
   }
   output.set("state", state);
+  if (issuerValues.length === 1) {
+    const issuer = issuerValues[0];
+    if (!issuer || !isSafeIssuer(issuer)) return null;
+    output.set("iss", issuer);
+  }
   return output;
 }
 

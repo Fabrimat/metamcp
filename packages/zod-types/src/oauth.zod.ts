@@ -221,11 +221,40 @@ export const UpsertOAuthSessionResponseSchema = z.union([
 // backend resolves it from the `mcp_servers` row keyed by the UUID in state
 // to prevent an authenticated user from steering discovery + token POST
 // at an attacker-controlled host (SSRF / authorization-code exfiltration).
+const OAuthAuthorizationResponseIssuerSchema = z
+  .string()
+  .min(1, "iss must not be empty")
+  .max(2048, "iss is too long")
+  .refine((value) => {
+    if (
+      !/^https:\/\//i.test(value) ||
+      value !== value.trim() ||
+      value.includes("?") ||
+      value.includes("#")
+    ) {
+      return false;
+    }
+    try {
+      const issuer = new URL(value);
+      return (
+        issuer.protocol === "https:" &&
+        !issuer.username &&
+        !issuer.password &&
+        !issuer.search &&
+        !issuer.hash
+      );
+    } catch {
+      return false;
+    }
+  }, "iss must be an absolute HTTPS URL without credentials, query, or fragment");
+
 export const ExchangeOAuthTokenRequestSchema = z.object({
   // Authorization code returned in the redirect query string.
   code: z.string().min(1, "code is required"),
   // Self-identifying state, verified against the caller's persisted session.
   state: z.string().min(1, "state is required"),
+  // RFC 9207 issuer identifier returned by supporting authorization servers.
+  iss: OAuthAuthorizationResponseIssuerSchema.optional(),
 });
 
 // Upstream OAuth error envelope (RFC 6749 §5.2). Surfaced to the frontend

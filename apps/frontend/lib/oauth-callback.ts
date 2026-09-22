@@ -1,7 +1,7 @@
 import { getServerSpecificKey, SESSION_KEYS } from "./constants";
 
 export type OAuthCallbackResult =
-  | { kind: "success"; code: string; state: string }
+  | { kind: "success"; code: string; state: string; iss?: string }
   | { kind: "error"; error: string; errorDescription?: string };
 
 export function parseOAuthCallback(search: string): OAuthCallbackResult {
@@ -34,7 +34,8 @@ export function parseOAuthCallback(search: string): OAuthCallbackResult {
     };
   }
 
-  return { kind: "success", code, state };
+  const iss = params.get("iss") ?? undefined;
+  return { kind: "success", code, state, ...(iss ? { iss } : {}) };
 }
 
 type StorageReader = Pick<Storage, "getItem" | "removeItem">;
@@ -42,6 +43,7 @@ type StorageReader = Pick<Storage, "getItem" | "removeItem">;
 type UpstreamExchange = (input: {
   code: string;
   state: string;
+  iss?: string;
 }) => Promise<unknown>;
 
 type DownstreamCompletion = (input: {
@@ -98,6 +100,7 @@ export async function completeOAuthCallback(
       const result = await exchangeUpstream({
         code: callback.code,
         state: callback.state,
+        ...(callback.iss ? { iss: callback.iss } : {}),
       });
       if (isRecord(result) && result.success === false) {
         return {

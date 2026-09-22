@@ -20,6 +20,19 @@ describe("parseOAuthCallback", () => {
     ).toEqual({ kind: "success", code: "code-123", state: STATE });
   });
 
+  it("preserves the RFC 9207 issuer on a successful callback", () => {
+    expect(
+      parseOAuthCallback(
+        `?code=code-123&state=${STATE}&iss=https%3A%2F%2Fidentity.example%2Ftenant`,
+      ),
+    ).toEqual({
+      kind: "success",
+      code: "code-123",
+      state: STATE,
+      iss: "https://identity.example/tenant",
+    });
+  });
+
   it("surfaces OAuth provider errors and ignores unrelated parameters", () => {
     expect(
       parseOAuthCallback(
@@ -142,6 +155,31 @@ describe("completeOAuthCallback", () => {
     expect(storage.getItem).not.toHaveBeenCalled();
     expect(storage.removeItem).not.toHaveBeenCalled();
     expect(navigate).toHaveBeenCalledWith(`/mcp-servers/${SERVER}`);
+  });
+
+  it("forwards the RFC 9207 issuer to the upstream token exchange", async () => {
+    const { storage } = createStorage({});
+    const exchangeUpstream = vi.fn().mockResolvedValue({
+      success: true,
+      data: { mcp_server_uuid: SERVER },
+      message: "authorized",
+    });
+
+    await completeOAuthCallback(
+      `?code=upstream-code&state=${STATE}&iss=https%3A%2F%2Fidentity.example%2Ftenant`,
+      {
+        storage,
+        exchangeUpstream,
+        completeDownstream: vi.fn(),
+        navigate: vi.fn(),
+      },
+    );
+
+    expect(exchangeUpstream).toHaveBeenCalledWith({
+      code: "upstream-code",
+      state: STATE,
+      iss: "https://identity.example/tenant",
+    });
   });
 
   it("cleans downstream callback context after a terminal provider error", async () => {

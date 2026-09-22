@@ -197,6 +197,26 @@ describe("OAuth public gateway callback relay", () => {
     );
   });
 
+  it("relays one valid RFC 9207 issuer with a successful callback", async () => {
+    await withGateway(
+      {
+        OAUTH_CLIENT_METADATA_URL: METADATA_URL,
+        APP_URL: "http://metamcp-app:12008",
+      },
+      async (baseUrl) => {
+        const state = freshState();
+        const response = await fetch(
+          `${baseUrl}/oauth/client-metadata?code=auth-code&state=${state}&iss=https%3A%2F%2Fidentity.example%2Ftenant`,
+          { redirect: "manual" },
+        );
+        expect(response.status).toBe(303);
+        expect(response.headers.get("location")).toBe(
+          `http://metamcp-app:12008/fe-oauth/callback?code=auth-code&state=${state}&iss=https%3A%2F%2Fidentity.example%2Ftenant`,
+        );
+      },
+    );
+  });
+
   it("relays only the allowlisted OAuth error values", async () => {
     await withGateway(
       {
@@ -213,6 +233,72 @@ describe("OAuth public gateway callback relay", () => {
         expect(response.headers.get("location")).toBe(
           `https://private.example/base/fe-oauth/callback?error=access_denied&error_description=User+declined&state=${state}`,
         );
+      },
+    );
+  });
+
+  it("relays one valid RFC 9207 issuer with an error callback", async () => {
+    await withGateway(
+      {
+        OAUTH_CLIENT_METADATA_URL: METADATA_URL,
+        APP_URL: "https://private.example/base",
+      },
+      async (baseUrl) => {
+        const state = freshState();
+        const response = await fetch(
+          `${baseUrl}/oauth/client-metadata?error=access_denied&state=${state}&iss=https%3A%2F%2Fidentity.example`,
+          { redirect: "manual" },
+        );
+        expect(response.status).toBe(303);
+        expect(response.headers.get("location")).toBe(
+          `https://private.example/base/fe-oauth/callback?error=access_denied&state=${state}&iss=https%3A%2F%2Fidentity.example`,
+        );
+      },
+    );
+  });
+
+  it.each([
+    "http://identity.example",
+    "https://user@identity.example",
+    "https://identity.example/?query=1",
+    "https://identity.example/#fragment",
+    "relative-issuer",
+    "https:identity.example",
+    `https://${"a".repeat(2048)}.example`,
+  ])("rejects unsafe RFC 9207 issuer %s", async (issuer) => {
+    await withGateway(
+      {
+        OAUTH_CLIENT_METADATA_URL: METADATA_URL,
+        APP_URL: "http://metamcp-app:12008",
+      },
+      async (baseUrl) => {
+        const params = new URLSearchParams({
+          code: "auth-code",
+          state: freshState(),
+          iss: issuer,
+        });
+        const response = await fetch(
+          `${baseUrl}/oauth/client-metadata?${params}`,
+          { redirect: "manual" },
+        );
+        expect(response.status).toBe(400);
+      },
+    );
+  });
+
+  it("rejects duplicate RFC 9207 issuer parameters", async () => {
+    await withGateway(
+      {
+        OAUTH_CLIENT_METADATA_URL: METADATA_URL,
+        APP_URL: "http://metamcp-app:12008",
+      },
+      async (baseUrl) => {
+        const state = freshState();
+        const response = await fetch(
+          `${baseUrl}/oauth/client-metadata?code=auth-code&state=${state}&iss=https%3A%2F%2Fone.example&iss=https%3A%2F%2Ftwo.example`,
+          { redirect: "manual" },
+        );
+        expect(response.status).toBe(400);
       },
     );
   });

@@ -23,6 +23,34 @@ describe("upstream callback contract", () => {
         .success,
     ).toBe(false);
   });
+  it("accepts a valid optional RFC 9207 issuer", () => {
+    expect(
+      ExchangeOAuthTokenRequestSchema.parse({
+        code: "C",
+        state: "S",
+        iss: "https://identity.example/tenant",
+      }),
+    ).toEqual({
+      code: "C",
+      state: "S",
+      iss: "https://identity.example/tenant",
+    });
+  });
+  it.each([
+    "",
+    "http://identity.example",
+    "https://user@identity.example",
+    "https://identity.example/?query=1",
+    "https://identity.example/#fragment",
+    "relative-issuer",
+    "https:identity.example",
+    `https://${"a".repeat(2048)}.example`,
+  ])("rejects invalid RFC 9207 issuer %s", (iss) => {
+    expect(
+      ExchangeOAuthTokenRequestSchema.safeParse({ code: "C", state: "S", iss })
+        .success,
+    ).toBe(false);
+  });
   it("returns the server UUID in the successful response", () => {
     const result = {
       success: true,

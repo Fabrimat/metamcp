@@ -1448,6 +1448,136 @@ describe("exchangeToken state CSRF validation", () => {
     );
   });
 
+  it.each([
+    {
+      name: "omits iss when the authorization server requires it",
+      inputIssuer: undefined,
+      metadataIssuer: "https://identity.example/tenant",
+      supported: true,
+    },
+    {
+      name: "uses a non-byte-identical iss for the persisted issuer",
+      inputIssuer: "https://identity.example/tenant/",
+      metadataIssuer: "https://identity.example/tenant",
+      supported: true,
+    },
+    {
+      name: "supplies iss when persisted discovery has no issuer",
+      inputIssuer: "https://identity.example/tenant",
+      metadataIssuer: undefined,
+      supported: false,
+    },
+  ])(
+    "rejects when callback $name before claim or fetch",
+    async ({ inputIssuer, metadataIssuer, supported }) => {
+      const {
+        oauthImplementations,
+        findByMcpServerAndUser,
+        compareAndSetExpectedState,
+        findServerByUuid,
+      } = await loadModule();
+      findServerByUuid.mockResolvedValue(
+        ownedServer(SERVER_UUID, "https://upstream.example.com/mcp"),
+      );
+      findByMcpServerAndUser.mockResolvedValue({
+        mcp_server_uuid: SERVER_UUID,
+        code_verifier: "v",
+        client_information: {
+          client_id: "c",
+          token_endpoint: "https://identity.example/token",
+        },
+        discovery_state: {
+          authorizationServerUrl: "https://identity.example/tenant",
+          authorizationServerMetadata: {
+            ...(metadataIssuer ? { issuer: metadataIssuer } : {}),
+            authorization_response_iss_parameter_supported: supported,
+            token_endpoint: "https://identity.example/token",
+          },
+        },
+        tokens: null,
+        expected_state: stateFor(SERVER_UUID),
+      });
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+      const result = await oauthImplementations.exchangeToken(
+        {
+          code: "C",
+          state: stateFor(SERVER_UUID),
+          ...(inputIssuer ? { iss: inputIssuer } : {}),
+        },
+        USER_ID,
+      );
+
+      expect(result).toEqual({
+        success: false,
+        error: "invalid_issuer",
+        error_description: "OAuth authorization response issuer is invalid.",
+      });
+      expect(compareAndSetExpectedState).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    {
+      name: "matches the required persisted issuer byte-for-byte",
+      inputIssuer: "https://identity.example/tenant",
+      supported: true,
+    },
+    {
+      name: "is omitted for a provider without RFC 9207 support",
+      inputIssuer: undefined,
+      supported: false,
+    },
+  ])(
+    "continues exchange when callback issuer $name",
+    async ({ inputIssuer, supported }) => {
+      const {
+        oauthImplementations,
+        findByMcpServerAndUser,
+        compareAndSetExpectedState,
+        findServerByUuid,
+      } = await loadModule();
+      findServerByUuid.mockResolvedValue(
+        ownedServer(SERVER_UUID, "https://upstream.example.com/mcp"),
+      );
+      findByMcpServerAndUser.mockResolvedValue({
+        mcp_server_uuid: SERVER_UUID,
+        code_verifier: "v",
+        client_information: {
+          client_id: "c",
+          token_endpoint: "https://identity.example/token",
+        },
+        discovery_state: {
+          authorizationServerUrl: "https://identity.example/tenant",
+          authorizationServerMetadata: {
+            issuer: "https://identity.example/tenant",
+            authorization_response_iss_parameter_supported: supported,
+            token_endpoint: "https://identity.example/token",
+          },
+        },
+        tokens: null,
+        expected_state: stateFor(SERVER_UUID),
+      });
+      const fetchSpy = vi
+        .spyOn(globalThis, "fetch")
+        .mockImplementation(upstreamSuccess as unknown as typeof fetch);
+
+      const result = await oauthImplementations.exchangeToken(
+        {
+          code: "C",
+          state: stateFor(SERVER_UUID),
+          ...(inputIssuer ? { iss: inputIssuer } : {}),
+        },
+        USER_ID,
+      );
+
+      expect(result.success).toBe(true);
+      expect(compareAndSetExpectedState).toHaveBeenCalled();
+      expect(fetchSpy).toHaveBeenCalled();
+    },
+  );
+
   it("expected_state null in DB fails closed before fetching", async () => {
     const {
       oauthImplementations,

@@ -77,6 +77,12 @@ function clientInfoAsRecord(
   return ci as unknown as Record<string, unknown>;
 }
 
+function valueAsRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
 function upstreamErrorResponse(error: UpstreamTokenError) {
   return {
     success: false as const,
@@ -260,6 +266,11 @@ export const oauthImplementations = {
       error_description:
         "OAuth state mismatch or expired flow. Re-initiate authorization.",
     };
+    const invalidIssuer = {
+      success: false as const,
+      error: "invalid_issuer",
+      error_description: "OAuth authorization response issuer is invalid.",
+    };
     const mcpServerUuid = parseUpstreamState(input.state);
     if (!mcpServerUuid) return invalidState;
     // Resolve the upstream URL from the DB (NOT from the request). This is
@@ -294,6 +305,24 @@ export const oauthImplementations = {
       !timingSafeEqual(expectedState, receivedState)
     )
       return invalidState;
+
+    const discoveryState = valueAsRecord(session.discovery_state);
+    const authorizationServerMetadata = valueAsRecord(
+      discoveryState?.authorizationServerMetadata,
+    );
+    const expectedIssuer =
+      typeof authorizationServerMetadata?.issuer === "string"
+        ? authorizationServerMetadata.issuer
+        : undefined;
+    const issuerRequired =
+      authorizationServerMetadata?.authorization_response_iss_parameter_supported ===
+      true;
+    if (
+      (issuerRequired && input.iss === undefined) ||
+      (input.iss !== undefined && input.iss !== expectedIssuer)
+    ) {
+      return invalidIssuer;
+    }
 
     if (!session.code_verifier) {
       return {
