@@ -101,6 +101,9 @@ USER nextjs
 # Expose frontend port (Next.js)
 EXPOSE 12008
 
+# Standalone public OAuth metadata/callback gateway (run as a separate process)
+EXPOSE 12010
+
 # Health check
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:12008/health || exit 1

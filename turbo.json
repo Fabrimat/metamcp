@@ -4,6 +4,8 @@
   "globalEnv": [
     "PORT",
     "APP_URL",
+    "OAUTH_CLIENT_METADATA_URL",
+    "OAUTH_PUBLIC_GATEWAY_PORT",
     "DATABASE_URL",
     "BETTER_AUTH_SECRET",
     "NEXT_PUBLIC_APP_URL",

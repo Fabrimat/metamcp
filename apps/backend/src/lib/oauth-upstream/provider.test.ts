@@ -18,17 +18,26 @@ vi.mock("../../utils/logger", () => ({
 
 const SERVER = "00000000-0000-4000-8000-000000000003";
 const USER = "user-a";
+const ORIGINAL_METADATA_URL = process.env.OAUTH_CLIENT_METADATA_URL;
 
 describe("OAuthUpstreamClientProvider user-scoped persistence", () => {
   beforeEach(() => {
+    delete process.env.OAUTH_CLIENT_METADATA_URL;
     vi.clearAllMocks();
     vi.spyOn(globalThis, "fetch").mockImplementation(
       async () => new Response("No resource metadata", { status: 404 }),
     );
   });
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    if (ORIGINAL_METADATA_URL === undefined)
+      delete process.env.OAUTH_CLIENT_METADATA_URL;
+    else process.env.OAUTH_CLIENT_METADATA_URL = ORIGINAL_METADATA_URL;
+    vi.restoreAllMocks();
+  });
 
-  const load = async () => {
+  const load = async (
+    redirectUriOverride: string | null = "http://127.0.0.1:3456/callback",
+  ) => {
     const repositories = await import("../../db/repositories");
     const { OAuthUpstreamClientProvider } = await import("./provider");
     const saveDynamicClientInformation = repositories.oauthSessionsRepository
@@ -39,7 +48,7 @@ describe("OAuthUpstreamClientProvider user-scoped persistence", () => {
         mcpServerUuid: SERVER,
         userId: USER,
         serverUrl: "https://mcp.example.com/mcp",
-        redirectUriOverride: "http://127.0.0.1:3456/callback",
+        redirectUriOverride,
       }),
       findByMcpServerAndUser: repositories.oauthSessionsRepository
         .findByMcpServerAndUser as ReturnType<typeof vi.fn>,
@@ -49,6 +58,78 @@ describe("OAuthUpstreamClientProvider user-scoped persistence", () => {
       saveDynamicClientInformation,
     };
   };
+
+  it("exposes CIMD as both client metadata URL and redirect URL", async () => {
+    process.env.OAUTH_CLIENT_METADATA_URL =
+      "https://oauth.example/oauth/client-metadata";
+    const { provider } = await load(null);
+
+    expect(provider.clientMetadataUrl).toBe(
+      "https://oauth.example/oauth/client-metadata",
+    );
+    expect(provider.redirectUrl).toBe(
+      "https://oauth.example/oauth/client-metadata",
+    );
+    expect(provider.clientMetadata.redirect_uris).toEqual([
+      "https://oauth.example/oauth/client-metadata",
+    ]);
+  });
+
+  it("disables CIMD when the server has a redirect override", async () => {
+    process.env.OAUTH_CLIENT_METADATA_URL =
+      "https://oauth.example/oauth/client-metadata";
+    const { provider } = await load("http://127.0.0.1:4567/callback");
+
+    expect(provider.clientMetadataUrl).toBeUndefined();
+    expect(provider.redirectUrl).toBe("http://127.0.0.1:4567/callback");
+  });
+
+  it("persists URL-based client information with byte-identical identifiers", async () => {
+    const metadataUrl = "https://oauth.example/oauth/client-metadata";
+    process.env.OAUTH_CLIENT_METADATA_URL = metadataUrl;
+    const { provider, saveDynamicClientInformation } = await load(null);
+
+    await provider.saveClientInformation({ client_id: metadataUrl });
+
+    expect(saveDynamicClientInformation).toHaveBeenCalledWith(SERVER, USER, {
+      client_id: metadataUrl,
+      _metamcp_registration: "url_based",
+      redirect_uris: [metadataUrl],
+      token_endpoint_auth_method: "none",
+    });
+  });
+
+  it("treats a URL-based registration for an old metadata URL as stale", async () => {
+    process.env.OAUTH_CLIENT_METADATA_URL =
+      "https://new.example/oauth/client-metadata";
+    const { provider, findByMcpServerAndUser } = await load(null);
+    findByMcpServerAndUser.mockResolvedValue({
+      client_information: {
+        client_id: "https://old.example/oauth/client-metadata",
+        _metamcp_registration: "url_based",
+      },
+    });
+
+    await expect(provider.clientInformation()).resolves.toBeUndefined();
+  });
+
+  it("keeps existing manual client information authoritative over CIMD", async () => {
+    process.env.OAUTH_CLIENT_METADATA_URL =
+      "https://oauth.example/oauth/client-metadata";
+    const { provider, findByMcpServerAndUser } = await load(null);
+    findByMcpServerAndUser.mockResolvedValue({
+      client_information: {
+        client_id: "manual-client",
+        _metamcp_registration: "manual",
+        redirect_uris: ["https://manual.example/callback"],
+      },
+    });
+
+    await expect(provider.clientInformation()).resolves.toMatchObject({
+      client_id: "manual-client",
+      _metamcp_registration: "manual",
+    });
+  });
 
   it("loads client information with the composite server and user key", async () => {
     const { provider, findByMcpServerAndUser } = await load();

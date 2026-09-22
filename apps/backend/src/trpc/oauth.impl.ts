@@ -24,6 +24,7 @@ import {
   oauthSessionsRepository,
 } from "../db/repositories";
 import { OAuthSessionsSerializer } from "../db/serializers";
+import { resolveOAuthClientMetadataUrl } from "../lib/oauth-upstream/client-metadata-url";
 import {
   isQuarantinedOAuthClient,
   OAuthClientConfirmationRequiredError,
@@ -58,6 +59,8 @@ import {
 // trailing-slash stripping. If APP_URL ends in a slash, both sides produce
 // a double slash; the only requirement is that the two values match.
 function resolveRedirectUri(): string {
+  const clientMetadataUrl = resolveOAuthClientMetadataUrl();
+  if (clientMetadataUrl) return clientMetadataUrl;
   const appUrl = process.env.APP_URL;
   if (!appUrl) {
     throw new Error(
@@ -648,8 +651,13 @@ export const oauthImplementations = {
         "server_error",
         "temporarily_unavailable",
       ]);
-      const code =
-        error instanceof OAuthError && allowedCodes.has(error.errorCode)
+      const registrationUnsupported =
+        error instanceof Error &&
+        error.message ===
+          "Incompatible auth server: does not support dynamic client registration";
+      const code = registrationUnsupported
+        ? "client_registration_unsupported"
+        : error instanceof OAuthError && allowedCodes.has(error.errorCode)
           ? error.errorCode
           : "upstream_error";
       logger.warn(
@@ -658,8 +666,9 @@ export const oauthImplementations = {
       return {
         success: false as const,
         error: code,
-        error_description:
-          "Upstream OAuth authorization failed. Check the configured client and provider endpoints, then retry.",
+        error_description: registrationUnsupported
+          ? "The upstream OAuth server supports neither URL-based client IDs nor dynamic client registration. Configure a manual OAuth client and retry."
+          : "Upstream OAuth authorization failed. Check the configured client and provider endpoints, then retry.",
       };
     }
   },

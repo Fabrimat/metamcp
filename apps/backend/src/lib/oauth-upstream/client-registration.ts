@@ -1,6 +1,7 @@
 export type OAuthClientRegistrationKind =
   | "manual"
   | "dynamic"
+  | "url_based"
   | "legacy_unconfirmed"
   | "empty";
 
@@ -19,7 +20,8 @@ export function classifyOAuthClientRegistration(
   if (!client) return "empty";
 
   const marker = client._metamcp_registration;
-  if (marker === "manual" || marker === "dynamic") return marker;
+  if (marker === "manual" || marker === "dynamic" || marker === "url_based")
+    return marker;
   if (marker === "legacy_unconfirmed") return "legacy_unconfirmed";
 
   // Old explicit pre-registrations did not carry a provenance marker, but

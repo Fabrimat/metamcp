@@ -130,8 +130,23 @@ describe("buildPreRegisteredClientInformation", () => {
 
 describe("resolveRedirectUri", () => {
   const original = process.env.APP_URL;
+  const originalMetadataUrl = process.env.OAUTH_CLIENT_METADATA_URL;
+  beforeEach(() => delete process.env.OAUTH_CLIENT_METADATA_URL);
   afterEach(() => {
-    process.env.APP_URL = original;
+    if (original === undefined) delete process.env.APP_URL;
+    else process.env.APP_URL = original;
+    if (originalMetadataUrl === undefined)
+      delete process.env.OAUTH_CLIENT_METADATA_URL;
+    else process.env.OAUTH_CLIENT_METADATA_URL = originalMetadataUrl;
+  });
+
+  it("uses the public client metadata endpoint when CIMD is enabled", () => {
+    process.env.APP_URL = "http://private-app:12008";
+    process.env.OAUTH_CLIENT_METADATA_URL =
+      "https://oauth.example/oauth/client-metadata";
+    expect(resolveRedirectUri()).toBe(
+      "https://oauth.example/oauth/client-metadata",
+    );
   });
 
   it("composes APP_URL + /fe-oauth/callback", () => {

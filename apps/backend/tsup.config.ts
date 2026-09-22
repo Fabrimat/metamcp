@@ -1,7 +1,7 @@
 import { defineConfig } from "tsup";
 
 export default defineConfig({
-  entry: ["src/index.ts"],
+  entry: ["src/index.ts", "src/oauth-public-gateway.ts"],
   format: ["esm"],
   target: "node18",
   outDir: "dist",

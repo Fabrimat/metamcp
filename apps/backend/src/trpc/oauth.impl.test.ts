@@ -26,6 +26,7 @@ vi.mock("../utils/logger", () => ({
 }));
 
 const ORIGINAL_APP_URL = process.env.APP_URL;
+const ORIGINAL_METADATA_URL = process.env.OAUTH_CLIENT_METADATA_URL;
 const TEST_STATE_TIME = Date.now();
 const stateFor = (uuid: string) =>
   `upstream.${uuid}.${TEST_STATE_TIME}.${"a".repeat(43)}`;
@@ -1705,6 +1706,7 @@ describe("exchangeToken state CSRF validation", () => {
 describe("oauthImplementations.startAuthorization", () => {
   beforeEach(async () => {
     process.env.APP_URL = "https://metamcp.example.com";
+    delete process.env.OAUTH_CLIENT_METADATA_URL;
     vi.clearAllMocks();
     const { oauthSessionsRepository } = await import("../db/repositories");
     vi.mocked(
@@ -1716,6 +1718,9 @@ describe("oauthImplementations.startAuthorization", () => {
   });
   afterEach(() => {
     process.env.APP_URL = ORIGINAL_APP_URL;
+    if (ORIGINAL_METADATA_URL === undefined)
+      delete process.env.OAUTH_CLIENT_METADATA_URL;
+    else process.env.OAUTH_CLIENT_METADATA_URL = ORIGINAL_METADATA_URL;
     vi.restoreAllMocks();
   });
 
@@ -1870,6 +1875,322 @@ describe("oauthImplementations.startAuthorization", () => {
       success: false,
       error: "oauth_client_confirmation_required",
     });
+  });
+
+  it("uses CIMD without DCR and persists URL-based client information", async () => {
+    const metadataUrl = "https://oauth.example/oauth/client-metadata";
+    process.env.OAUTH_CLIENT_METADATA_URL = metadataUrl;
+    const {
+      oauthImplementations,
+      findByMcpServerAndUser,
+      findServerByUuid,
+      saveDynamicClientInformation,
+    } = await loadModule();
+    findServerByUuid.mockResolvedValue(ownedServer(SERVER_UUID, SERVER_URL));
+    findByMcpServerAndUser.mockResolvedValue(undefined);
+    vi.mocked(fetch).mockImplementation(async (url) => {
+      const value = String(url);
+      if (value.includes("/.well-known/oauth-protected-resource"))
+        return new Response("not found", { status: 404 });
+      if (value.includes("/.well-known/oauth-authorization-server"))
+        return jsonResponse(200, {
+          issuer: "https://mcp.example.com",
+          authorization_endpoint: "https://mcp.example.com/authorize",
+          token_endpoint: "https://mcp.example.com/token",
+          response_types_supported: ["code"],
+          client_id_metadata_document_supported: true,
+        });
+      throw new Error(`unexpected fetch in test: ${value}`);
+    });
+
+    const result = await oauthImplementations.startAuthorization(
+      { mcp_server_uuid: SERVER_UUID },
+      USER_ID,
+    );
+
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("unreachable");
+    const authorizationUrl = new URL(result.data.authorization_url);
+    expect(authorizationUrl.searchParams.get("client_id")).toBe(metadataUrl);
+    expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(metadataUrl);
+    expect(saveDynamicClientInformation).toHaveBeenCalledWith(
+      SERVER_UUID,
+      USER_ID,
+      {
+        client_id: metadataUrl,
+        _metamcp_registration: "url_based",
+        redirect_uris: [metadataUrl],
+        token_endpoint_auth_method: "none",
+      },
+    );
+    expect(
+      vi
+        .mocked(fetch)
+        .mock.calls.some(([url]) => String(url).endsWith("/register")),
+    ).toBe(false);
+  });
+
+  it("replaces a persisted URL-based registration when the metadata URL changes", async () => {
+    const metadataUrl = "https://new.example/oauth/client-metadata";
+    process.env.OAUTH_CLIENT_METADATA_URL = metadataUrl;
+    const {
+      oauthImplementations,
+      findByMcpServerAndUser,
+      findServerByUuid,
+      saveDynamicClientInformation,
+    } = await loadModule();
+    findServerByUuid.mockResolvedValue(ownedServer(SERVER_UUID, SERVER_URL));
+    findByMcpServerAndUser.mockResolvedValue({
+      mcp_server_uuid: SERVER_UUID,
+      user_id: USER_ID,
+      client_information: {
+        client_id: "https://old.example/oauth/client-metadata",
+        redirect_uris: ["https://old.example/oauth/client-metadata"],
+        token_endpoint_auth_method: "none",
+        _metamcp_registration: "url_based",
+      },
+      discovery_state: {
+        authorizationServerUrl: "https://mcp.example.com",
+        authorizationServerMetadata: {
+          issuer: "https://mcp.example.com",
+          authorization_endpoint: "https://mcp.example.com/authorize",
+          token_endpoint: "https://mcp.example.com/token",
+          response_types_supported: ["code"],
+          client_id_metadata_document_supported: true,
+        },
+      },
+    });
+
+    const result = await oauthImplementations.startAuthorization(
+      { mcp_server_uuid: SERVER_UUID },
+      USER_ID,
+    );
+
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("unreachable");
+    expect(
+      new URL(result.data.authorization_url).searchParams.get("client_id"),
+    ).toBe(metadataUrl);
+    expect(saveDynamicClientInformation).toHaveBeenCalledWith(
+      SERVER_UUID,
+      USER_ID,
+      expect.objectContaining({
+        client_id: metadataUrl,
+        redirect_uris: [metadataUrl],
+        _metamcp_registration: "url_based",
+      }),
+    );
+  });
+
+  it("keeps a persisted manual client authoritative when CIMD is configured", async () => {
+    const metadataUrl = "https://oauth.example/oauth/client-metadata";
+    process.env.OAUTH_CLIENT_METADATA_URL = metadataUrl;
+    const {
+      oauthImplementations,
+      findByMcpServerAndUser,
+      findServerByUuid,
+      saveDynamicClientInformation,
+    } = await loadModule();
+    findServerByUuid.mockResolvedValue(ownedServer(SERVER_UUID, SERVER_URL));
+    findByMcpServerAndUser.mockResolvedValue({
+      mcp_server_uuid: SERVER_UUID,
+      user_id: USER_ID,
+      client_information: {
+        client_id: "manual-client",
+        client_secret: "manual-secret",
+        _metamcp_registration: "manual",
+      },
+      discovery_state: {
+        authorizationServerUrl: "https://mcp.example.com",
+        authorizationServerMetadata: {
+          issuer: "https://mcp.example.com",
+          authorization_endpoint: "https://mcp.example.com/authorize",
+          token_endpoint: "https://mcp.example.com/token",
+          response_types_supported: ["code"],
+          client_id_metadata_document_supported: true,
+        },
+      },
+    });
+
+    const result = await oauthImplementations.startAuthorization(
+      { mcp_server_uuid: SERVER_UUID },
+      USER_ID,
+    );
+
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("unreachable");
+    const authorizationUrl = new URL(result.data.authorization_url);
+    expect(authorizationUrl.searchParams.get("client_id")).toBe(
+      "manual-client",
+    );
+    expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(metadataUrl);
+    expect(saveDynamicClientInformation).not.toHaveBeenCalled();
+  });
+
+  it("disables CIMD for a redirect override and retains DCR behavior", async () => {
+    process.env.OAUTH_CLIENT_METADATA_URL =
+      "https://oauth.example/oauth/client-metadata";
+    const {
+      oauthImplementations,
+      findByMcpServerAndUser,
+      findServerByUuid,
+      saveDynamicClientInformation,
+    } = await loadModule();
+    const override = "http://127.0.0.1:5555/callback";
+    findServerByUuid.mockResolvedValue(
+      ownedServer(SERVER_UUID, SERVER_URL, { redirectUri: override }),
+    );
+    findByMcpServerAndUser.mockResolvedValue(undefined);
+    vi.mocked(fetch).mockImplementation(async (url) => {
+      const value = String(url);
+      if (value.includes("/.well-known/oauth-protected-resource"))
+        return new Response("not found", { status: 404 });
+      if (value.includes("/.well-known/oauth-authorization-server"))
+        return jsonResponse(200, {
+          issuer: "https://mcp.example.com",
+          authorization_endpoint: "https://mcp.example.com/authorize",
+          token_endpoint: "https://mcp.example.com/token",
+          registration_endpoint: "https://mcp.example.com/register",
+          response_types_supported: ["code"],
+          client_id_metadata_document_supported: true,
+        });
+      if (value === "https://mcp.example.com/register")
+        return jsonResponse(201, {
+          client_id: "dynamic-client",
+          redirect_uris: [override],
+          token_endpoint_auth_method: "none",
+          grant_types: ["authorization_code", "refresh_token"],
+          response_types: ["code"],
+        });
+      throw new Error(`unexpected fetch in test: ${value}`);
+    });
+
+    const result = await oauthImplementations.startAuthorization(
+      { mcp_server_uuid: SERVER_UUID },
+      USER_ID,
+    );
+
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("unreachable");
+    const authorizationUrl = new URL(result.data.authorization_url);
+    expect(authorizationUrl.searchParams.get("client_id")).toBe(
+      "dynamic-client",
+    );
+    expect(authorizationUrl.searchParams.get("redirect_uri")).toBe(override);
+    expect(saveDynamicClientInformation).toHaveBeenCalledWith(
+      SERVER_UUID,
+      USER_ID,
+      expect.objectContaining({
+        client_id: "dynamic-client",
+        _metamcp_registration: "dynamic",
+        redirect_uris: [override],
+      }),
+    );
+  });
+
+  it("returns an actionable sanitized error when neither CIMD nor DCR is supported", async () => {
+    process.env.OAUTH_CLIENT_METADATA_URL =
+      "https://oauth.example/oauth/client-metadata";
+    const { oauthImplementations, findByMcpServerAndUser, findServerByUuid } =
+      await loadModule();
+    findServerByUuid.mockResolvedValue(ownedServer(SERVER_UUID, SERVER_URL));
+    findByMcpServerAndUser.mockResolvedValue(undefined);
+    vi.mocked(fetch).mockImplementation(async (url) => {
+      const value = String(url);
+      if (value.includes("/.well-known/oauth-protected-resource"))
+        return new Response("not found", { status: 404 });
+      if (value.includes("/.well-known/oauth-authorization-server"))
+        return jsonResponse(200, {
+          issuer: "https://mcp.example.com",
+          authorization_endpoint: "https://mcp.example.com/authorize",
+          token_endpoint: "https://mcp.example.com/token",
+          response_types_supported: ["code"],
+          client_id_metadata_document_supported: false,
+        });
+      throw new Error(`unexpected fetch in test: ${value}`);
+    });
+
+    const result = await oauthImplementations.startAuthorization(
+      { mcp_server_uuid: SERVER_UUID },
+      USER_ID,
+    );
+
+    expect(result).toEqual({
+      success: false,
+      error: "client_registration_unsupported",
+      error_description:
+        "The upstream OAuth server supports neither URL-based client IDs nor dynamic client registration. Configure a manual OAuth client and retry.",
+    });
+    expect(JSON.stringify(result)).not.toContain("client_secret");
+  });
+
+  it("sends the persisted CIMD client ID and redirect URI byte-identically at token exchange", async () => {
+    const metadataUrl = "https://oauth.example:443/oauth/client-metadata";
+    process.env.OAUTH_CLIENT_METADATA_URL = metadataUrl;
+    const {
+      oauthImplementations,
+      findByMcpServerAndUser,
+      findServerByUuid,
+      saveDynamicClientInformation,
+      upsert,
+    } = await loadModule();
+    findServerByUuid.mockResolvedValue(ownedServer(SERVER_UUID, SERVER_URL));
+    findByMcpServerAndUser.mockResolvedValue(undefined);
+    let tokenBody: URLSearchParams | undefined;
+    vi.mocked(fetch).mockImplementation(async (url, init) => {
+      const value = String(url);
+      if (value.includes("/.well-known/oauth-protected-resource"))
+        return new Response("not found", { status: 404 });
+      if (value.includes("/.well-known/oauth-authorization-server"))
+        return jsonResponse(200, {
+          issuer: "https://mcp.example.com",
+          authorization_endpoint: "https://mcp.example.com/authorize",
+          token_endpoint: "https://mcp.example.com/token",
+          response_types_supported: ["code"],
+          client_id_metadata_document_supported: true,
+        });
+      if (value === "https://mcp.example.com/token") {
+        tokenBody = init?.body as URLSearchParams;
+        return jsonResponse(200, {
+          access_token: "access-token",
+          token_type: "Bearer",
+        });
+      }
+      throw new Error(`unexpected fetch in test: ${value}`);
+    });
+
+    const started = await oauthImplementations.startAuthorization(
+      { mcp_server_uuid: SERVER_UUID },
+      USER_ID,
+    );
+    expect(started.success).toBe(true);
+    if (!started.success) throw new Error("unreachable");
+    const state = new URL(started.data.authorization_url).searchParams.get(
+      "state",
+    );
+    if (!state) throw new Error("state missing");
+    const persisted = saveDynamicClientInformation.mock.calls[0]?.[2];
+    const discovery = upsert.mock.calls.find(
+      ([input]) => input.discovery_state,
+    )?.[0].discovery_state;
+    findByMcpServerAndUser.mockResolvedValue({
+      mcp_server_uuid: SERVER_UUID,
+      user_id: USER_ID,
+      client_information: persisted,
+      discovery_state: discovery,
+      code_verifier: "verifier",
+      expected_state: state,
+      tokens: null,
+    });
+
+    const exchanged = await oauthImplementations.exchangeToken(
+      { code: "authorization-code", state },
+      USER_ID,
+    );
+
+    expect(exchanged.success).toBe(true);
+    expect(tokenBody?.get("client_id")).toBe(metadataUrl);
+    expect(tokenBody?.get("redirect_uri")).toBe(metadataUrl);
   });
 
   it("returns access_denied when a different user owns the server (same ownership gate as exchangeToken/refreshToken)", async () => {

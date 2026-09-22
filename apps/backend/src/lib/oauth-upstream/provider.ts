@@ -34,6 +34,7 @@ import {
 import { oauthSessionsRepository } from "../../db/repositories";
 import { resolveRedirectUri } from "../../trpc/pre-registered-oauth";
 import logger from "../../utils/logger";
+import { resolveOAuthClientMetadataUrl } from "./client-metadata-url";
 import {
   isQuarantinedOAuthClient,
   OAuthClientConfirmationRequiredError,
@@ -61,6 +62,7 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
   private readonly mcpServerUuid: string;
   private readonly userId: string;
   private readonly redirectUriOverride: string | null;
+  readonly clientMetadataUrl: string | undefined;
   private pendingState: string | undefined;
 
   // Populated by redirectToAuthorization() instead of navigating — see
@@ -73,6 +75,9 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
     this.mcpServerUuid = options.mcpServerUuid;
     this.userId = options.userId;
     this.redirectUriOverride = options.redirectUriOverride;
+    this.clientMetadataUrl = this.redirectUriOverride
+      ? undefined
+      : resolveOAuthClientMetadataUrl();
   }
 
   private async loadSession() {
@@ -83,7 +88,9 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
   }
 
   get redirectUrl(): string {
-    return this.redirectUriOverride ?? resolveRedirectUri();
+    return (
+      this.redirectUriOverride ?? this.clientMetadataUrl ?? resolveRedirectUri()
+    );
   }
 
   get clientMetadata(): OAuthClientMetadata {
@@ -105,6 +112,12 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
     const ci = clientInfoAsRecord(session?.client_information);
     if (!ci || isQuarantinedOAuthClient(ci) || typeof ci.client_id !== "string")
       return undefined;
+    if (
+      ci._metamcp_registration === "url_based" &&
+      (!this.clientMetadataUrl || ci.client_id !== this.clientMetadataUrl)
+    ) {
+      return undefined;
+    }
     return ci as unknown as OAuthClientInformationMixed;
   }
 
@@ -120,10 +133,14 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
   async saveClientInformation(
     clientInformation: OAuthClientInformationMixed,
   ): Promise<void> {
+    const urlBased =
+      this.clientMetadataUrl !== undefined &&
+      clientInformation.client_id === this.clientMetadataUrl;
     const patched: Record<string, unknown> = {
       ...clientInformation,
-      _metamcp_registration: "dynamic",
+      _metamcp_registration: urlBased ? "url_based" : "dynamic",
       redirect_uris: [this.redirectUrl],
+      ...(urlBased && { token_endpoint_auth_method: "none" }),
     };
     const saved = await oauthSessionsRepository.saveDynamicClientInformation(
       this.mcpServerUuid,
@@ -135,7 +152,7 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
       throw new OAuthClientConfirmationRequiredError();
     }
     logger.info(
-      `[oauth] DCR registered client — server=${this.mcpServerUuid} ` +
+      `[oauth] ${urlBased ? "URL-based" : "DCR"} client saved — server=${this.mcpServerUuid} ` +
         `client_id=${clientInformation.client_id} ` +
         `client_secret=${redactToken(
           (clientInformation as { client_secret?: string }).client_secret,

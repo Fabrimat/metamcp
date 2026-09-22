@@ -2,6 +2,7 @@ import { OAuthClientInformation } from "@modelcontextprotocol/sdk/shared/auth.js
 import { OAuthClientInfoRequest } from "@repo/zod-types";
 
 import type { OAuthSessionsRepository } from "../db/repositories/oauth-sessions.repo";
+import { resolveOAuthClientMetadataUrl } from "../lib/oauth-upstream/client-metadata-url";
 import { isManualOAuthClient } from "../lib/oauth-upstream/client-registration";
 
 // Build the full `oauth_sessions.client_information` jsonb from
@@ -51,6 +52,8 @@ export function buildPreRegisteredClientInformation(
 
 // Resolve MetaMCP's own OAuth callback URL from APP_URL.
 export function resolveRedirectUri(): string {
+  const clientMetadataUrl = resolveOAuthClientMetadataUrl();
+  if (clientMetadataUrl) return clientMetadataUrl;
   const appUrl = process.env.APP_URL;
   if (!appUrl) {
     throw new Error(
