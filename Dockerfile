@@ -48,9 +48,11 @@ COPY . .
 # Build all packages and apps
 RUN pnpm build
 
-RUN sed -i -e "s/30000/600000/" \
-    "node_modules/.pnpm/next@15.5.12_react-dom@19.1.2_react@19.1.2__react@19.1.2/node_modules/next/dist/server/lib/router-utils/proxy-request.js" \
-    "node_modules/.pnpm/next@15.5.12_react-dom@19.1.2_react@19.1.2__react@19.1.2/node_modules/next/dist/esm/server/lib/router-utils/proxy-request.js"
+RUN sed -i -e "s/proxyTimeout || 30000/proxyTimeout || 600000/" \
+    "apps/frontend/node_modules/next/dist/server/lib/router-utils/proxy-request.js" \
+    "apps/frontend/node_modules/next/dist/esm/server/lib/router-utils/proxy-request.js" \
+    && grep -Fq 'proxyTimeout || 600000' "apps/frontend/node_modules/next/dist/server/lib/router-utils/proxy-request.js" \
+    && grep -Fq 'proxyTimeout || 600000' "apps/frontend/node_modules/next/dist/esm/server/lib/router-utils/proxy-request.js"
 
 # Production runner stage
 FROM base AS runner
@@ -106,4 +108,4 @@ HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:12008/health || exit 1
 
 # Start both backend and frontend
-CMD ["./docker-entrypoint.sh"] 
+CMD ["./docker-entrypoint.sh"]
