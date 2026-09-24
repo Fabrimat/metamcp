@@ -30,6 +30,7 @@ import {
   OAuthClientMetadata,
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
+import { checkResourceAllowed } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 
 import { oauthSessionsRepository } from "../../db/repositories";
 import { resolveRedirectUri } from "../../trpc/pre-registered-oauth";
@@ -61,6 +62,7 @@ function clientInfoAsRecord(ci: unknown): Record<string, unknown> | null {
 export class OAuthUpstreamClientProvider implements OAuthClientProvider {
   private readonly mcpServerUuid: string;
   private readonly userId: string;
+  private readonly serverUrl: string;
   private readonly redirectUriOverride: string | null;
   readonly clientMetadataUrl: string | undefined;
   private pendingState: string | undefined;
@@ -74,6 +76,7 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
   constructor(options: OAuthUpstreamClientProviderOptions) {
     this.mcpServerUuid = options.mcpServerUuid;
     this.userId = options.userId;
+    this.serverUrl = options.serverUrl;
     this.redirectUriOverride = options.redirectUriOverride;
     this.clientMetadataUrl = this.redirectUriOverride
       ? undefined
@@ -242,6 +245,27 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
     const session = await this.loadSession();
     const ci = clientInfoAsRecord(session?.client_information);
     if (isQuarantinedOAuthClient(ci)) return undefined;
+    let discovery = (session?.discovery_state ?? undefined) as unknown as
+      | OAuthDiscoveryState
+      | undefined;
+    const savedResource = discovery?.resourceMetadata?.resource;
+    if (typeof savedResource === "string") {
+      try {
+        if (
+          new URL(this.serverUrl).origin === new URL(savedResource).origin &&
+          !checkResourceAllowed({
+            requestedResource: this.serverUrl,
+            configuredResource: savedResource,
+          })
+        ) {
+          // The MCP URL changed after authorization. A new authorization
+          // must discover metadata for the current URL and resource.
+          discovery = undefined;
+        }
+      } catch {
+        // Leave malformed state for the SDK to reject explicitly.
+      }
+    }
     const authorizationEndpoint =
       typeof ci?.authorization_endpoint === "string"
         ? ci.authorization_endpoint
@@ -249,9 +273,7 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
     const tokenEndpoint =
       typeof ci?.token_endpoint === "string" ? ci.token_endpoint : undefined;
     if (!authorizationEndpoint || !tokenEndpoint) {
-      return (session?.discovery_state ?? undefined) as unknown as
-        | OAuthDiscoveryState
-        | undefined;
+      return discovery;
     }
 
     let authorizationServerUrl: string;
@@ -264,9 +286,7 @@ export class OAuthUpstreamClientProvider implements OAuthClientProvider {
     }
 
     return {
-      ...(session?.discovery_state as unknown as
-        | OAuthDiscoveryState
-        | undefined),
+      ...discovery,
       authorizationServerUrl,
       authorizationServerMetadata: {
         issuer: authorizationServerUrl,

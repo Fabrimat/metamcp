@@ -71,6 +71,10 @@ export class McpServerPool {
   // Session cleanup timer
   private cleanupTimer: NodeJS.Timeout | null = null;
 
+  // Shared clients may be referenced by more than one session. Serialize
+  // releases so the final owner can recycle or close the connection.
+  private cleanupSessionQueue: Promise<void> = Promise.resolve();
+
   // Health check timer for idle sessions
   private healthCheckTimer: NodeJS.Timeout | null = null;
 
@@ -144,25 +148,21 @@ export class McpServerPool {
    * Count all connections (idle + active + pending) for a specific server UUID
    */
   private countConnectionsForServer(serverUuid: string): number {
-    let count = 0;
-
-    count += Object.keys(this.idleSessions).filter((cacheKey) =>
-      connectionKeyBelongsToServer(cacheKey, serverUuid),
-    ).length;
-
-    // Count active sessions across all sessionIds
-    for (const sessionServers of Object.values(this.activeSessions)) {
-      count += Object.keys(sessionServers).filter((cacheKey) =>
-        connectionKeyBelongsToServer(cacheKey, serverUuid),
-      ).length;
+    const clients = new Set<ConnectedClient>();
+    for (const [cacheKey, client] of Object.entries(this.idleSessions)) {
+      if (connectionKeyBelongsToServer(cacheKey, serverUuid))
+        clients.add(client);
     }
-
-    // Count pending idle creation
-    count += [...this.creatingIdleSessions].filter((cacheKey) =>
+    for (const sessionServers of Object.values(this.activeSessions)) {
+      for (const [cacheKey, client] of Object.entries(sessionServers)) {
+        if (connectionKeyBelongsToServer(cacheKey, serverUuid))
+          clients.add(client);
+      }
+    }
+    const pending = [...this.creatingIdleSessions].filter((cacheKey) =>
       connectionKeyBelongsToServer(cacheKey, serverUuid),
     ).length;
-
-    return count;
+    return clients.size + pending;
   }
 
   /**
@@ -561,6 +561,14 @@ export class McpServerPool {
    * Recycles healthy connections back to the idle pool instead of destroying them.
    */
   async cleanupSession(sessionId: string): Promise<void> {
+    const operation = this.cleanupSessionQueue
+      .catch(() => undefined)
+      .then(() => this.cleanupSessionExclusive(sessionId));
+    this.cleanupSessionQueue = operation.catch(() => undefined);
+    return operation;
+  }
+
+  private async cleanupSessionExclusive(sessionId: string): Promise<void> {
     const activeSession = this.activeSessions[sessionId];
     if (!activeSession) {
       return;
@@ -572,6 +580,18 @@ export class McpServerPool {
     // Try to recycle each connection back to idle pool
     for (const [cacheKey, client] of Object.entries(activeSession)) {
       const serverUuid = serverUuidFromConnectionKey(cacheKey);
+      // A connection at the cap may be shared by several sessions. Another
+      // session still using it owns its lifecycle until the final reference.
+      if (
+        Object.entries(this.activeSessions).some(
+          ([otherSessionId, servers]) =>
+            otherSessionId !== sessionId &&
+            Object.values(servers).includes(client),
+        )
+      ) {
+        continue;
+      }
+      if (this.idleSessions[cacheKey] === client) continue;
       if (!this.idleSessions[cacheKey]) {
         // No idle session for this server — recycle the connection
         this.idleSessions[cacheKey] = client;
@@ -613,9 +633,9 @@ export class McpServerPool {
   async cleanupAll(): Promise<void> {
     // Cleanup all active sessions
     const activeSessionIds = Object.keys(this.activeSessions);
-    await Promise.allSettled(
-      activeSessionIds.map((sessionId) => this.cleanupSession(sessionId)),
-    );
+    for (const sessionId of activeSessionIds) {
+      await this.cleanupSession(sessionId);
+    }
 
     // Cleanup all idle sessions
     await Promise.allSettled(
@@ -697,14 +717,11 @@ export class McpServerPool {
    * Get total connection count (idle + active + pending)
    */
   private getTotalConnectionCount(): number {
-    const idle = Object.keys(this.idleSessions).length;
-    const active = Object.keys(this.activeSessions).reduce(
-      (total, sessionId) =>
-        total + Object.keys(this.activeSessions[sessionId]).length,
-      0,
-    );
-    const pending = this.creatingIdleSessions.size;
-    return idle + active + pending;
+    const clients = new Set<ConnectedClient>(Object.values(this.idleSessions));
+    for (const servers of Object.values(this.activeSessions)) {
+      for (const client of Object.values(servers)) clients.add(client);
+    }
+    return clients.size + this.creatingIdleSessions.size;
   }
 
   /**
@@ -776,57 +793,70 @@ export class McpServerPool {
   async invalidateServerConnection(
     sessionId: string,
     serverUuid: string,
+    oauthUserId?: string,
   ): Promise<void> {
+    const matchesConnection = (cacheKey: string) =>
+      oauthUserId === undefined
+        ? connectionKeyBelongsToServer(cacheKey, serverUuid)
+        : cacheKey === connectionKey(serverUuid, oauthUserId);
     // Collect every doomed ConnectedClient across all active sessions plus
     // the idle slot, dropping the map entries as we go.
     const cleanupPromises: Promise<void>[] = [];
+    const doomedClients = new Set<ConnectedClient>();
 
     for (const [sid, sessionServers] of Object.entries(this.activeSessions)) {
       for (const [cacheKey, cachedClient] of Object.entries(sessionServers)) {
-        if (!connectionKeyBelongsToServer(cacheKey, serverUuid)) {
+        if (!matchesConnection(cacheKey)) {
           continue;
         }
         // Each cleanup is wrapped so one failure can't strand the rest — we
         // WANT every stale slot dropped from the map regardless.
-        cleanupPromises.push(
-          (async () => {
-            try {
-              await cachedClient.cleanup();
-            } catch (error) {
-              logger.error(
-                `Error cleaning up invalidated active session ${sid}/${serverUuid}:`,
-                error,
-              );
-            }
-          })(),
-        );
+        if (!doomedClients.has(cachedClient)) {
+          doomedClients.add(cachedClient);
+          cleanupPromises.push(
+            (async () => {
+              try {
+                await cachedClient.cleanup();
+              } catch (error) {
+                logger.error(
+                  `Error cleaning up invalidated active session ${sid}/${serverUuid}:`,
+                  error,
+                );
+              }
+            })(),
+          );
+        }
         delete sessionServers[cacheKey];
         this.sessionToServers[sid]?.delete(cacheKey);
       }
     }
 
     for (const [cacheKey, idleClient] of Object.entries(this.idleSessions)) {
-      if (!connectionKeyBelongsToServer(cacheKey, serverUuid)) {
+      if (!matchesConnection(cacheKey)) {
         continue;
       }
-      cleanupPromises.push(
-        (async () => {
-          try {
-            await idleClient.cleanup();
-          } catch (error) {
-            logger.error(
-              `Error cleaning up invalidated idle session for ${serverUuid}:`,
-              error,
-            );
-          }
-        })(),
-      );
+      if (!doomedClients.has(idleClient)) {
+        doomedClients.add(idleClient);
+        cleanupPromises.push(
+          (async () => {
+            try {
+              await idleClient.cleanup();
+            } catch (error) {
+              logger.error(
+                `Error cleaning up invalidated idle session for ${serverUuid}:`,
+                error,
+              );
+            }
+          })(),
+        );
+      }
       delete this.idleSessions[cacheKey];
     }
 
     // Drop the in-flight idle-creation guard so the recovery's getSession
     // call isn't blocked from spawning a fresh connection.
     for (const cacheKey of this.getKnownConnectionKeysForServer(serverUuid)) {
+      if (!matchesConnection(cacheKey)) continue;
       this.idleSessionGenerations[cacheKey] =
         (this.idleSessionGenerations[cacheKey] ?? 0) + 1;
       this.creatingIdleSessions.delete(cacheKey);
@@ -837,7 +867,7 @@ export class McpServerPool {
     if (cleanupPromises.length > 0) {
       logger.warn(
         `Invalidated ${cleanupPromises.length} pooled backend connection(s) for server ${serverUuid} ` +
-          `(triggered by session ${sessionId}; cascaded across every active + idle slot for this serverUuid)`,
+          `(triggered by session ${sessionId}; scope: ${oauthUserId === undefined ? "all principals" : "one OAuth principal"})`,
       );
     } else {
       logger.warn(
@@ -1150,9 +1180,9 @@ export class McpServerPool {
           `Cleaning up ${expiredSessionIds.length} expired MCP server pool sessions: ${expiredSessionIds.join(", ")}`,
         );
 
-        await Promise.allSettled(
-          expiredSessionIds.map((sessionId) => this.cleanupSession(sessionId)),
-        );
+        for (const sessionId of expiredSessionIds) {
+          await this.cleanupSession(sessionId);
+        }
       }
     } catch (error) {
       logger.error("Error during automatic session cleanup:", error);

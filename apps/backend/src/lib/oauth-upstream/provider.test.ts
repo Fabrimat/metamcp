@@ -37,6 +37,7 @@ describe("OAuthUpstreamClientProvider user-scoped persistence", () => {
 
   const load = async (
     redirectUriOverride: string | null = "http://127.0.0.1:3456/callback",
+    serverUrl = "https://mcp.example.com/mcp",
   ) => {
     const repositories = await import("../../db/repositories");
     const { OAuthUpstreamClientProvider } = await import("./provider");
@@ -47,7 +48,7 @@ describe("OAuthUpstreamClientProvider user-scoped persistence", () => {
       provider: new OAuthUpstreamClientProvider({
         mcpServerUuid: SERVER,
         userId: USER,
-        serverUrl: "https://mcp.example.com/mcp",
+        serverUrl,
         redirectUriOverride,
       }),
       findByMcpServerAndUser: repositories.oauthSessionsRepository
@@ -329,6 +330,28 @@ describe("OAuthUpstreamClientProvider user-scoped persistence", () => {
     await expect(
       auth(provider, { serverUrl: "https://mcp.example.com/mcp" }),
     ).rejects.toThrow(/Protected resource/);
+  });
+
+  it("rediscovers OAuth metadata after the MCP URL changes from /mcp to root", async () => {
+    const { provider, findByMcpServerAndUser } = await load(
+      "http://127.0.0.1:3456/callback",
+      "https://mcp.example.com",
+    );
+    findByMcpServerAndUser.mockResolvedValue({
+      discovery_state: {
+        authorizationServerUrl: "https://auth.example.com",
+        authorizationServerMetadata: {
+          issuer: "https://auth.example.com",
+          authorization_endpoint: "https://auth.example.com/authorize",
+          token_endpoint: "https://auth.example.com/token",
+          response_types_supported: ["code"],
+        },
+        resourceMetadata: { resource: "https://mcp.example.com/mcp" },
+      },
+      client_information: null,
+    });
+
+    await expect(provider.discoveryState()).resolves.toBeUndefined();
   });
 
   it("persists and reloads serializable OAuth discovery state", async () => {
