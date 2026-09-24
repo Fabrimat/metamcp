@@ -74,21 +74,19 @@ export function validateRedirectUri(
       return false;
     }
 
-    // For production, only allow HTTPS
-    if (
-      process.env.NODE_ENV === "production" &&
-      parsedUri.protocol !== "https:"
-    ) {
-      return false;
-    }
-
-    // Prevent localhost/private IPs in production
     if (process.env.NODE_ENV === "production") {
       const hostname = parsedUri.hostname.toLowerCase();
-      if (
+      const isLoopback =
         hostname === "localhost" ||
         hostname === "127.0.0.1" ||
-        hostname === "::1" ||
+        hostname === "[::1]";
+
+      // Native OAuth clients use HTTP loopback callbacks (RFC 8252).
+      // Keep HTTPS mandatory for every non-loopback callback.
+      if (isLoopback) {
+        if (parsedUri.protocol !== "http:") return false;
+      } else if (
+        parsedUri.protocol !== "https:" ||
         hostname.startsWith("192.168.") ||
         hostname.startsWith("10.") ||
         hostname.startsWith("172.")
